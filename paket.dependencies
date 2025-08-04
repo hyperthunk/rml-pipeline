@@ -1,0 +1,11 @@
+source https://api.nuget.org/v3/index.json
+
+storage: none
+nuget Streams 0.6.0
+
+group Test
+source https://www.nuget.org/api/v2
+
+nuget Expecto 10.2.3
+nuget Microsoft.NET.Test.Sdk
+nuget YoloDev.Expecto.TestSdk 0.15.3
