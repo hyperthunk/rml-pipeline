@@ -1,8 +1,6 @@
 namespace RMLPipeline
 
 module Model = 
-    
-    open System
 
     // Base types for URIs and literals
     type URI = string
@@ -22,12 +20,12 @@ module Model =
 
     // Term types for RML mapping
     type TermType =
-        | BlankNode
-        | IRI
-        | Literal
-        | URI
-        | UnsafeIRI
-        | UnsafeURI
+        | BlankNodeTerm
+        | IRITerm
+        | LiteralTerm
+        | URITerm
+        | UnsafeIRITerm
+        | UnsafeURITerm
 
     // Reference formulations
     type ReferenceFormulation =
@@ -67,19 +65,19 @@ module Model =
 
     // Subject Map
     and SubjectMap = {
-        TermMap: TermMap
+        SubjectTermMap: TermMap
         Class: IRI list
         GraphMap: GraphMap list
     }
 
     // Predicate Map
     and PredicateMap = {
-        TermMap: TermMap
+        PredicateTermMap: TermMap
     }
 
     // Object Map
     and ObjectMap = {
-        TermMap: TermMap
+        ObjectTermMap: TermMap
         Datatype: IRI option
         DatatypeMap: DatatypeMap option
         Language: LanguageTag option
@@ -88,12 +86,12 @@ module Model =
 
     // Graph Map
     and GraphMap = {
-        TermMap: TermMap
+        GraphTermMap: TermMap
     }
 
     // Datatype Map
     and DatatypeMap = {
-        TermMap: TermMap
+        DatatypeTermMap: TermMap
     }
 
     // Language Map
@@ -142,7 +140,7 @@ module Model =
 
     // Gather Map for collections
     and GatherMap = {
-        TermMap: TermMap
+        GatherTermMap: TermMap
         Gather: IRI list
         AllowEmptyListAndContainer: bool option
         Strategy: Strategy option
@@ -163,7 +161,7 @@ module Model =
     }
 
     and FunctionMap = {
-        TermMap: TermMap
+        FunctionTermMap: TermMap
     }
 
     and Input = {
@@ -175,11 +173,11 @@ module Model =
     }
 
     and ParameterMap = {
-        TermMap: TermMap
+        ParameterTermMap: TermMap
     }
 
     and ReturnMap = {
-        TermMap: TermMap
+        ReturnTermMap: TermMap
     }
 
     // Source and Target types (RML-IO)
@@ -218,8 +216,8 @@ module Model =
 
     // Logical Source and Target
     and AbstractLogicalSource = {
-        Iterator: string option
-        ReferenceFormulation: ReferenceFormulation option
+        SourceIterator: string option
+        SourceReferenceFormulation: ReferenceFormulation option
     }
 
     and LogicalSource = {
@@ -336,6 +334,13 @@ module Model =
     and IRISafeAnnotation = {
         OnFields: Field list
     }
+    
+    [<Interface>]
+    type TripleOutputStream =
+        // abstract member EmitTypedTriple: subject: RDFNode * predicate: RDFNode * objValue: RDFNode * datatype: IRI option -> unit
+        abstract member EmitTypedTriple: subject: string * predicate: string * objValue: string * datatype: string option -> unit
+        abstract member EmitLangTriple: subject: string * predicate: string * objValue: string * lang: string -> unit
+        abstract member EmitTriple: subject: string * predicate: string * objValue: string -> unit
 
     // Helper functions for creating common mappings
     module Builders =
@@ -366,17 +371,17 @@ module Model =
         }
         
         let createSubjectMap termType classes = {
-            TermMap = { emptyTermMap with TermType = termType }
+            SubjectTermMap = { emptyTermMap with TermType = termType }
             Class = defaultArg classes []
             GraphMap = []
         }
         
         let createPredicateMap termType = {
-            TermMap = { emptyTermMap with TermType = termType }
+            PredicateTermMap = { emptyTermMap with TermType = termType }
         }
         
         let createObjectMap termType datatype language = {
-            TermMap = { emptyTermMap with TermType = termType }
+            ObjectTermMap = { emptyTermMap with TermType = termType }
             Datatype = datatype
             DatatypeMap = None
             Language = language
@@ -394,8 +399,8 @@ module Model =
         
         let createLogicalSource iterator referenceFormulation source = {
             AbstractLogicalSource = {
-                Iterator = iterator
-                ReferenceFormulation = referenceFormulation
+                SourceIterator = iterator
+                SourceReferenceFormulation = referenceFormulation
             }
             Source = source
             Path = None

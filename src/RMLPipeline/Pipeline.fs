@@ -1,0 +1,812 @@
+namespace RMLPipeline.Execution
+
+module Pipeline =
+
+    open System
+    open System.IO
+    open System.Collections.Generic
+    open System.Collections.Concurrent
+    open System.Threading
+    open System.Threading.Tasks
+    open System.Runtime.CompilerServices
+    open Newtonsoft.Json
+    open Nessos.Streams
+    open RMLPipeline.Model
+    open RMLPipeline
+    open RMLPipeline.FastMap.Types
+
+    // Planning structures
+    [<Struct>]
+    type PathHash = PathHash of uint64
+
+    [<Struct>]
+    type PredicateKey = {
+        Subject: string
+        Predicate: string
+        Hash: uint64
+    }
+
+    [<Struct>]
+    type JoinKey = {
+        ParentKey: string
+        ChildKey: string
+        Hash: uint64
+    }
+
+    // Token data for streaming
+    [<Struct>]
+    type StreamToken = {
+        TokenType: JsonToken
+        Value: obj
+        Path: string
+        Depth: int
+        IsComplete: bool
+    }
+
+    // Optimized predicate tuple structure (unchanged)
+    type PredicateTuple = {
+        SubjectTemplate: string
+        PredicateValue: string
+        ObjectTemplate: string
+        ObjectDatatype: string option
+        ObjectLanguage: string option
+        IsConstant: bool
+        SourcePath: string
+        Hash: uint64
+    }
+
+    // Join tuple for efficient join processing (unchanged)
+    type PredicateJoinTuple = {
+        ParentTuple: PredicateTuple
+        ChildTuple: PredicateTuple
+        JoinCondition: Join
+        ParentPath: string
+        ChildPath: string
+        Hash: uint64
+    }
+
+    // Planning structures (unchanged)
+    type TriplesMapPlan = {
+        OriginalMap: TriplesMap
+        Index: int
+        IteratorPath: string
+        PathSegments: string[]
+        Dependencies: int[]
+        Priority: int
+        PredicateTuples: PredicateTuple[]
+        JoinTuples: PredicateJoinTuple[]
+        EstimatedComplexity: int
+    }
+
+    // Aggregated planning information (unchanged)
+    type RMLPlan = {
+        OrderedMaps: TriplesMapPlan[]
+        PredicateIndex: FastMap<uint64, PredicateTuple[]>
+        JoinIndex: FastMap<uint64, PredicateJoinTuple[]>
+        PathToMaps: FastMap<string, int[]>
+        DependencyGroups: int[][]
+        StringPool: string[]
+        mutable StringCount: int
+    }
+
+    // Physical data structures
+    type PredicateTupleTable = {
+        Tuples: ConcurrentDictionary<uint64, PredicateTuple>
+        DuplicateCheck: ConcurrentDictionary<string, bool>
+        FlushThreshold: int
+        mutable CurrentSize: int
+    }
+
+    type PredicateJoinTable = {
+        JoinTuples: ConcurrentDictionary<uint64, PredicateJoinTuple>
+        ParentData: ConcurrentDictionary<string, obj>
+        ChildData: ConcurrentDictionary<string, obj>
+        mutable CurrentSize: int
+    }
+
+    // Streaming infrastructure
+    type StreamChannel = {
+        TokenQueue: ConcurrentQueue<StreamToken>
+        SignalEvent: ManualResetEventSlim
+        IsCompleted: bool ref
+        mutable IsStarted: bool
+    }
+
+    type StreamingPool = {
+        Plan: RMLPlan
+        Channels: StreamChannel[]
+        ProcessingTasks: Task[]
+        GlobalPredicateTable: PredicateTupleTable
+        GlobalJoinTable: PredicateJoinTable
+        Output: TripleOutputStream
+    }
+
+    // RML Planning module 
+    module RMLPlanner =
+                
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        let hashString (str: string) : uint64 =
+            let mutable hash = 14695981039346656037UL
+            for i = 0 to str.Length - 1 do
+                hash <- hash ^^^ uint64 str.[i]
+                hash <- hash * 1099511628211UL
+            hash
+        
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        let hashPredicateKey (subject: string) (predicate: string) : uint64 =
+            let subjectHash = hashString subject
+            let predicateHash = hashString predicate
+            subjectHash ^^^ (predicateHash <<< 1)
+        
+        let extractPredicateTuples (triplesMap: TriplesMap) (mapIndex: int) : PredicateTuple[] =
+            let tuples = ResizeArray<PredicateTuple>()
+            let iteratorPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
+            
+            let subjectTemplate = 
+                match triplesMap.SubjectMap with
+                | Some sm -> 
+                    match sm.SubjectTermMap.ExpressionMap.Template with
+                    | Some template -> template
+                    | None -> 
+                        match sm.SubjectTermMap.ExpressionMap.Constant with
+                        | Some (URI uri) -> uri
+                        | Some (Literal lit) -> lit
+                        | Some (BlankNode bn) -> "_:" + bn
+                        | None -> ""
+                | None -> 
+                    triplesMap.Subject |> Option.defaultValue ""
+            
+            for pom in triplesMap.PredicateObjectMap do
+                for predicate in pom.Predicate do
+                    for obj in pom.Object do
+                        let objValue, datatype, language = 
+                            match obj with
+                            | URI uri -> uri, None, None
+                            | Literal lit -> lit, None, None
+                            | BlankNode bn -> "_:" + bn, None, None
+                        
+                        let hash = hashPredicateKey subjectTemplate predicate
+                        
+                        tuples.Add({
+                            SubjectTemplate = subjectTemplate
+                            PredicateValue = predicate
+                            ObjectTemplate = objValue
+                            ObjectDatatype = datatype
+                            ObjectLanguage = language
+                            IsConstant = true
+                            SourcePath = iteratorPath
+                            Hash = hash
+                        })
+                    
+                    for objMap in pom.ObjectMap do
+                        let objTemplate = 
+                            match objMap.ObjectTermMap.ExpressionMap.Template with
+                            | Some template -> template
+                            | None ->
+                                match objMap.ObjectTermMap.ExpressionMap.Reference with
+                                | Some reference -> "{" + reference + "}"
+                                | None ->
+                                    match objMap.ObjectTermMap.ExpressionMap.Constant with
+                                    | Some (URI uri) -> uri
+                                    | Some (Literal lit) -> lit
+                                    | Some (BlankNode bn) -> "_:" + bn
+                                    | None -> ""
+                        
+                        let hash = hashPredicateKey subjectTemplate predicate
+                        
+                        tuples.Add({
+                            SubjectTemplate = subjectTemplate
+                            PredicateValue = predicate
+                            ObjectTemplate = objTemplate
+                            ObjectDatatype = objMap.Datatype
+                            ObjectLanguage = objMap.Language
+                            IsConstant = false
+                            SourcePath = iteratorPath
+                            Hash = hash
+                        })
+                
+                for predMap in pom.PredicateMap do
+                    let predicateTemplate = 
+                        match predMap.PredicateTermMap.ExpressionMap.Template with
+                        | Some template -> template
+                        | None ->
+                            match predMap.PredicateTermMap.ExpressionMap.Reference with
+                            | Some reference -> "{" + reference + "}"
+                            | None ->
+                                match predMap.PredicateTermMap.ExpressionMap.Constant with
+                                | Some (URI uri) -> uri
+                                | Some (Literal lit) -> lit
+                                | Some (BlankNode bn) -> "_:" + bn
+                                | None -> ""
+                    
+                    for obj in pom.Object do
+                        let objValue, datatype, language = 
+                            match obj with
+                            | URI uri -> uri, None, None
+                            | Literal lit -> lit, None, None
+                            | BlankNode bn -> "_:" + bn, None, None
+                        
+                        let hash = hashPredicateKey subjectTemplate predicateTemplate
+                        
+                        tuples.Add({
+                            SubjectTemplate = subjectTemplate
+                            PredicateValue = predicateTemplate
+                            ObjectTemplate = objValue
+                            ObjectDatatype = datatype
+                            ObjectLanguage = language
+                            IsConstant = false
+                            SourcePath = iteratorPath
+                            Hash = hash
+                        })
+            
+            tuples.ToArray()
+        
+        let extractJoinTuples (triplesMaps: TriplesMap[]) (mapIndex: int) : PredicateJoinTuple[] =
+            let joinTuples = ResizeArray<PredicateJoinTuple>()
+            let triplesMap = triplesMaps.[mapIndex]
+            
+            for pom in triplesMap.PredicateObjectMap do
+                for refObjMap in pom.RefObjectMap do
+                    let parentMap = refObjMap.ParentTriplesMap
+                    let parentIndex = 
+                        triplesMaps 
+                        |> Array.findIndex (fun tm -> Object.ReferenceEquals(tm, parentMap))
+                    
+                    let parentTuples = extractPredicateTuples parentMap parentIndex
+                    let childTuples = extractPredicateTuples triplesMap mapIndex
+                    
+                    for join in refObjMap.JoinCondition do
+                        let parentPath = parentMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
+                        let childPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
+
+                        for parentTuple in parentTuples do
+                            for childTuple in childTuples do
+                                let hash = parentTuple.Hash ^^^ (childTuple.Hash <<< 1)
+                                
+                                joinTuples.Add({
+                                    ParentTuple = parentTuple
+                                    ChildTuple = childTuple
+                                    JoinCondition = join
+                                    ParentPath = parentPath
+                                    ChildPath = childPath
+                                    Hash = hash
+                                })
+            
+            joinTuples.ToArray()
+        
+        let calculateComplexity (triplesMap: TriplesMap) : int =
+            let mutable complexity = 0
+            
+            let iteratorDepth = 
+                triplesMap.LogicalSource.SourceIterator 
+                |> Option.map (fun path -> path.Split('.').Length)
+                |> Option.defaultValue 1
+            complexity <- complexity + iteratorDepth * 10
+            
+            for pom in triplesMap.PredicateObjectMap do
+                complexity <- complexity + pom.PredicateMap.Length * 5
+                complexity <- complexity + pom.ObjectMap.Length * 5
+                complexity <- complexity + pom.RefObjectMap.Length * 20
+            
+            match triplesMap.SubjectMap with
+            | Some sm ->
+                complexity <- complexity + sm.Class.Length * 2
+                complexity <- complexity + sm.GraphMap.Length * 3
+            | None -> ()
+            
+            complexity
+        
+        let detectOverlaps (plans: TriplesMapPlan[]) : (int * int * float)[] =
+            let overlaps = ResizeArray<int * int * float>()
+            
+            for i = 0 to plans.Length - 1 do
+                for j = i + 1 to plans.Length - 1 do
+                    let plan1 = plans.[i]
+                    let plan2 = plans.[j]
+                    
+                    let pathOverlap = 
+                        if plan1.IteratorPath = plan2.IteratorPath then 1.0
+                        elif plan1.IteratorPath.StartsWith(plan2.IteratorPath) || 
+                            plan2.IteratorPath.StartsWith(plan1.IteratorPath) then 0.5
+                        else 0.0
+                    
+                    let predicateOverlap = 
+                        let commonHashes = 
+                            plan1.PredicateTuples 
+                            |> Array.map (_.Hash)
+                            |> Set.ofArray
+                            |> Set.intersect (plan2.PredicateTuples |> Array.map (_.Hash) |> Set.ofArray)
+                        
+                        let totalHashes = plan1.PredicateTuples.Length + plan2.PredicateTuples.Length
+                        if totalHashes > 0 then
+                            float (commonHashes.Count * 2) / float totalHashes
+                        else 0.0
+                    
+                    let totalOverlap = (pathOverlap + predicateOverlap) / 2.0
+                    if totalOverlap > 0.1 then
+                        overlaps.Add(i, j, totalOverlap)
+            
+            overlaps.ToArray()
+        
+        let rec createRMLPlan (triplesMaps: TriplesMap[]) : RMLPlan =
+            let initialPlans = 
+                triplesMaps
+                |> Array.mapi (fun i tm ->
+                    let iteratorPath = tm.LogicalSource.SourceIterator |> Option.defaultValue "$"
+                    let pathSegments = iteratorPath.TrimStart('$', '.').Split('.')
+                    let predicateTuples = extractPredicateTuples tm i
+                    let joinTuples = extractJoinTuples triplesMaps i
+                    let complexity = calculateComplexity tm
+                    
+                    {
+                        OriginalMap = tm
+                        Index = i
+                        IteratorPath = iteratorPath
+                        PathSegments = pathSegments
+                        Dependencies = [||]
+                        Priority = 0
+                        PredicateTuples = predicateTuples
+                        JoinTuples = joinTuples
+                        EstimatedComplexity = complexity
+                    })
+            
+            let overlaps = detectOverlaps initialPlans
+            let priorities = Array.zeroCreate initialPlans.Length
+            
+            for (i, j, overlapScore) in overlaps do
+                priorities.[i] <- priorities.[i] + int (overlapScore * 100.0)
+                priorities.[j] <- priorities.[j] + int (overlapScore * 100.0)
+            
+            let orderedPlans = 
+                initialPlans
+                |> Array.mapi (fun i plan -> { plan with Priority = priorities.[i] })
+                |> Array.sortBy (fun plan -> plan.Priority + plan.EstimatedComplexity)
+            
+            let predicateIndex = 
+                orderedPlans
+                |> Array.collect (_.PredicateTuples)
+                |> Array.groupBy (_.Hash)
+                |> Array.map (fun (hash, tuples) -> (hash, tuples))
+                |> Array.fold (fun acc (hash, tuples) ->
+                    FastMap.add hash tuples acc) FastMap.empty<uint64, PredicateTuple[]>
+            
+            let joinIndex = 
+                orderedPlans
+                |> Array.collect (_.JoinTuples)
+                |> Array.groupBy (_.Hash)
+                |> Array.map (fun (hash, tuples) -> (hash, tuples))
+                |> Array.fold (fun acc (hash, tuples) ->
+                    FastMap.add hash tuples acc) FastMap.empty<uint64, PredicateJoinTuple[]>
+
+            let pathToMaps = 
+                orderedPlans
+                |> Array.mapi (fun i plan -> (plan.IteratorPath, i))
+                |> Array.groupBy fst
+                |> Array.map (fun (path, pairs) -> (path, pairs |> Array.map snd))
+                |> Array.fold (fun acc (path, indices) ->
+                    FastMap.add path indices acc) FastMap.empty<string, int[]>
+
+            let dependencies = Array.zeroCreate orderedPlans.Length
+            for i = 0 to orderedPlans.Length - 1 do
+                let plan = orderedPlans.[i]
+                let deps = ResizeArray<int>()
+                
+                for joinTuple in plan.JoinTuples do
+                    let parentPath = joinTuple.ParentPath
+                    match FastMap.tryFind parentPath pathToMaps with
+                    | ValueSome indices ->
+                        for idx in indices do
+                            if idx <> i then deps.Add(idx)
+                    | ValueNone -> ()
+                
+                dependencies.[i] <- deps.ToArray()
+            
+            let updatedPlans = 
+                orderedPlans 
+                |> Array.mapi (fun i plan -> { plan with Dependencies = dependencies.[i] })
+            
+            let dependencyGroups = groupByDependencies updatedPlans
+            
+            {
+                OrderedMaps = updatedPlans
+                PredicateIndex = predicateIndex
+                JoinIndex = joinIndex
+                PathToMaps = pathToMaps
+                DependencyGroups = dependencyGroups
+                StringPool = Array.zeroCreate 10000
+                StringCount = 0
+            }
+        
+        and groupByDependencies (plans: TriplesMapPlan[]) : int[][] =
+            let visited = Array.zeroCreate plans.Length
+            let groups = ResizeArray<int[]>()
+            
+            let rec dfs (index: int) (currentGroup: ResizeArray<int>) : unit =
+                if not visited.[index] then
+                    visited.[index] <- true
+                    currentGroup.Add(index)
+                    
+                    for dep in plans.[index].Dependencies do
+                        dfs dep currentGroup
+                    
+                    for i = 0 to plans.Length - 1 do
+                        if Array.contains index plans.[i].Dependencies then
+                            dfs i currentGroup
+            
+            for i = 0 to plans.Length - 1 do
+                if not visited.[i] then
+                    let group = ResizeArray<int>()
+                    dfs i group
+                    if group.Count > 0 then
+                        groups.Add(group.ToArray())
+            
+            groups.ToArray()
+
+    // Physical Data Structures
+    module PhysicalDataStructures =
+        
+        let createPredicateTupleTable (flushThreshold: int) : PredicateTupleTable =
+            {
+                Tuples = ConcurrentDictionary<uint64, PredicateTuple>()
+                DuplicateCheck = ConcurrentDictionary<string, bool>()
+                FlushThreshold = flushThreshold
+                CurrentSize = 0
+            }
+        
+        let createPredicateJoinTable () : PredicateJoinTable =
+            {
+                JoinTuples = ConcurrentDictionary<uint64, PredicateJoinTuple>()
+                ParentData = ConcurrentDictionary<string, obj>()
+                ChildData = ConcurrentDictionary<string, obj>()
+                CurrentSize = 0
+            }
+        
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        let addPredicateTuple (table: PredicateTupleTable) (tuple: PredicateTuple) (data: Dictionary<string, obj>) : bool =
+            let key = sprintf "%s|%s|%s" tuple.SubjectTemplate tuple.PredicateValue tuple.ObjectTemplate
+            
+            if table.DuplicateCheck.ContainsKey(key) then
+                false
+            else
+                table.DuplicateCheck.TryAdd(key, true) |> ignore
+                table.Tuples.TryAdd(tuple.Hash, tuple) |> ignore
+                Interlocked.Increment(&table.CurrentSize) |> ignore
+                true
+        
+        let rec flushIfNeeded (table: PredicateTupleTable) (output: TripleOutputStream) (context: Dictionary<string, obj>) : unit =
+            if table.CurrentSize >= table.FlushThreshold then
+                for kvp in table.Tuples do
+                    let tuple = kvp.Value
+                    processPredicateTuple tuple output context
+                
+                table.Tuples.Clear()
+                table.DuplicateCheck.Clear()
+                table.CurrentSize <- 0
+        
+        and processPredicateTuple (tuple: PredicateTuple) (output: TripleOutputStream) (context: Dictionary<string, obj>) : unit =
+            try
+                let subject = expandTemplate tuple.SubjectTemplate context
+                let predicate = if tuple.IsConstant then tuple.PredicateValue else expandTemplate tuple.PredicateValue context
+                let objValue = if tuple.IsConstant then tuple.ObjectTemplate else expandTemplate tuple.ObjectTemplate context
+                
+                match tuple.ObjectDatatype with
+                | Some datatype -> output.EmitTypedTriple(subject, predicate, objValue, Some datatype)
+                | None ->
+                    match tuple.ObjectLanguage with
+                    | Some lang -> output.EmitLangTriple(subject, predicate, objValue, lang)
+                    | None -> output.EmitTriple(subject, predicate, objValue)
+            with
+            | _ -> ()
+        
+        and expandTemplate (template: string) (context: Dictionary<string, obj>) : string =
+            if not (template.Contains("{")) then
+                template
+            else
+                let mutable result = template
+                for kvp in context do
+                    let placeholder = "{" + kvp.Key + "}"
+                    if result.Contains(placeholder) then
+                        result <- result.Replace(placeholder, kvp.Value.ToString())
+                result
+
+    // Streaming Infrastructure
+    module StreamInfrastructure =
+        
+        open PhysicalDataStructures
+        
+        // Create stream channel for non-blocking communication
+        let createStreamChannel () : StreamChannel =
+            {
+                TokenQueue = ConcurrentQueue<StreamToken>()
+                SignalEvent = new ManualResetEventSlim(false)
+                IsCompleted = ref false
+                IsStarted = false
+            }
+        
+        // Non-blocking token enqueue
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        let enqueueToken (channel: StreamChannel) (token: StreamToken) : unit =
+            channel.TokenQueue.Enqueue(token)
+            channel.SignalEvent.Set()
+        
+        // Signal completion to channel
+        let completeChannel (channel: StreamChannel) : unit =
+            channel.IsCompleted := true
+            channel.SignalEvent.Set()
+        
+        // Create processing stream for dependency group using ParStream
+        let createProcessingStream (groupIndex: int) (group: int[]) (pool: StreamingPool) : ParStream<unit> =
+            // Create token stream from channels
+            let tokenSeq = seq {
+                let mutable shouldContinue = true
+                while shouldContinue do
+                    let mutable foundToken = false
+                    
+                    // Check all channels in this group for tokens
+                    for mapIndex in group do
+                        let channel = pool.Channels.[mapIndex]
+                        let mutable token = Unchecked.defaultof<StreamToken>
+                        
+                        if channel.TokenQueue.TryDequeue(&token) then
+                            foundToken <- true
+                            yield (mapIndex, token)
+                    
+                    if not foundToken then
+                        // Wait for signal or completion
+                        let allCompleted = 
+                            group |> Array.forall (fun idx -> !(pool.Channels.[idx].IsCompleted))
+                        
+                        if allCompleted then
+                            shouldContinue <- false
+                        else
+                            // Wait for any channel in group to signal
+                            let events = group |> Array.map (fun idx -> pool.Channels.[idx].SignalEvent.WaitHandle)
+                            WaitHandle.WaitAny(events, 100) |> ignore
+                            
+                            // Reset signals
+                            for idx in group do
+                                pool.Channels.[idx].SignalEvent.Reset()
+            }
+            
+            tokenSeq
+            |> ParStream.ofSeq
+            |> ParStream.map (fun (mapIndex, token) ->
+                let plan = pool.Plan.OrderedMaps.[mapIndex]
+                
+                if token.IsComplete then
+                    // Process accumulated data for this iterator
+                    let context = Dictionary<string, obj>()
+                    
+                    // Extract data from token value if it's a dictionary
+                    match token.Value with
+                    | :? Dictionary<string, obj> as dict ->
+                        for kvp in dict do
+                            context.[kvp.Key] <- kvp.Value
+                    | _ -> ()
+                    
+                    // Process predicate tuples
+                    for tuple in plan.PredicateTuples do
+                        if addPredicateTuple pool.GlobalPredicateTable tuple context then
+                            flushIfNeeded pool.GlobalPredicateTable pool.Output context
+                    
+                    // Process join tuples
+                    for joinTuple in plan.JoinTuples do
+                        processPredicateTuple joinTuple.ParentTuple pool.Output context
+                        processPredicateTuple joinTuple.ChildTuple pool.Output context
+            )
+    open StreamInfrastructure
+
+    // Stream Processor
+    module StreamProcessor =
+        
+        open StreamInfrastructure
+        open PhysicalDataStructures
+        
+        // Initialize streaming pool with channels for each dependency group
+        let createStreamingPool (triplesMaps: TriplesMap[]) (output: TripleOutputStream) : StreamingPool =
+            let plan = RMLPlanner.createRMLPlan triplesMaps
+            let channels = Array.init plan.OrderedMaps.Length (fun _ -> createStreamChannel())
+            let globalPredicateTable = createPredicateTupleTable 1000
+            let globalJoinTable = createPredicateJoinTable()
+            
+            // Create processing tasks for each dependency group
+            let processingTasks = 
+                plan.DependencyGroups
+                |> Array.mapi (fun groupIdx group ->
+                    Task.Run(fun () ->
+                        let processingStream = 
+                            createProcessingStream groupIdx group 
+                                { 
+                                    Plan = plan
+                                    Channels = channels
+                                    ProcessingTasks = [||] // Will be set after creation
+                                    GlobalPredicateTable = globalPredicateTable
+                                    GlobalJoinTable = globalJoinTable
+                                    Output = output
+                                }
+
+                        // Start lazy processing - only begins when tokens arrive
+                        processingStream |> ParStream.iter id
+                    ))
+            
+            {
+                Plan = plan
+                Channels = channels
+                ProcessingTasks = processingTasks
+                GlobalPredicateTable = globalPredicateTable
+                GlobalJoinTable = globalJoinTable
+                Output = output
+            }
+        
+        // Process JSON token and route to appropriate streams
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        let processJsonToken (pool: StreamingPool) (tokenType: JsonToken) (value: obj) (currentPath: string) (accumulatedData: Dictionary<string, obj>) : unit =
+            let token = {
+                TokenType = tokenType
+                Value = value
+                Path = currentPath
+                Depth = currentPath.Split('.').Length
+                IsComplete = (tokenType = JsonToken.EndObject || tokenType = JsonToken.EndArray)
+            }
+            
+            // Route to appropriate channels based on path matching
+            match FastMap.tryFind currentPath pool.Plan.PathToMaps with
+            | ValueSome mapIndices ->
+                for mapIndex in mapIndices do
+                    let channel = pool.Channels.[mapIndex]
+                    
+                    // Mark channel as started and enqueue token
+                    if not channel.IsStarted then
+                        channel.IsStarted <- true
+                    
+                    // For completion tokens, include accumulated data
+                    let finalToken = 
+                        if token.IsComplete then
+                            { token with Value = accumulatedData :> obj }
+                        else
+                            token
+                    
+                    enqueueToken channel finalToken
+            | ValueNone -> ()
+
+    // Main RML Stream Processor
+    module RMLStreamProcessor =
+        
+        open StreamProcessor
+        
+        let processRMLStream 
+                (reader: JsonTextReader) 
+                (triplesMaps: TriplesMap[]) 
+                (output: TripleOutputStream) : Task<unit> =
+            
+            task {
+                reader.SupportMultipleContent <- true
+                reader.DateParseHandling <- DateParseHandling.None
+                
+                // Step 1: Initialize streaming pool (pre-processing phase)
+                let pool = createStreamingPool triplesMaps output
+                
+                // Step 2: Track JSON parsing state
+                let pathStack = ResizeArray<string>()
+                let accumulatedData = Dictionary<string, obj>()
+                let mutable currentProperty = ""
+                let mutable isInArrayContext = false
+                let arrayContextStack = ResizeArray<bool>()
+                
+                // Helper function to build proper JSONPath syntax
+                let buildJsonPath (pathStack: ResizeArray<string>) (tokenType: JsonToken) =
+                    let basePath = 
+                        if pathStack.Count = 0 then 
+                            "$" 
+                        else 
+                            "$." + String.Join(".", pathStack)
+                    
+                    match tokenType with
+                    | JsonToken.StartArray -> 
+                        basePath
+                    | JsonToken.EndArray ->
+                        basePath + "[*]"
+                    | JsonToken.EndObject when isInArrayContext ->
+                        basePath + "[*]"
+                    | _ -> basePath
+                
+                try
+                    // Step 3: Stream JSON tokens to parallel processors
+                    while reader.Read() do
+                        match reader.TokenType with
+                        | JsonToken.StartObject ->
+                            arrayContextStack.Add(isInArrayContext)
+                            let jsonPath = buildJsonPath pathStack reader.TokenType
+                            processJsonToken pool reader.TokenType reader.Value jsonPath accumulatedData
+                            
+                        | JsonToken.StartArray ->
+                            arrayContextStack.Add(isInArrayContext)
+                            isInArrayContext <- true
+                            let jsonPath = buildJsonPath pathStack reader.TokenType
+                            processJsonToken pool reader.TokenType reader.Value jsonPath accumulatedData
+                            
+                        | JsonToken.PropertyName ->
+                            let propName = reader.Value :?> string
+                            pathStack.Add(propName)
+                            currentProperty <- propName
+                            
+                        | JsonToken.EndObject ->
+                            let jsonPath = buildJsonPath pathStack reader.TokenType
+                            
+                            // Send completion token with accumulated data
+                            let dataClone = Dictionary<string, obj>(accumulatedData)
+                            processJsonToken pool reader.TokenType dataClone jsonPath dataClone
+                            
+                            // Clean up path and restore array context
+                            if pathStack.Count > 0 then
+                                pathStack.RemoveAt(pathStack.Count - 1)
+                            if arrayContextStack.Count > 0 then
+                                isInArrayContext <- arrayContextStack.[arrayContextStack.Count - 1]
+                                arrayContextStack.RemoveAt(arrayContextStack.Count - 1)
+                            
+                        | JsonToken.EndArray ->
+                            let jsonPath = buildJsonPath pathStack reader.TokenType
+                            
+                            // Send completion token with accumulated data
+                            let dataClone = Dictionary<string, obj>(accumulatedData)
+                            processJsonToken pool reader.TokenType dataClone jsonPath dataClone
+                            
+                            // Clean up path and restore array context
+                            if pathStack.Count > 0 then
+                                pathStack.RemoveAt(pathStack.Count - 1)
+                            if arrayContextStack.Count > 0 then
+                                isInArrayContext <- arrayContextStack.[arrayContextStack.Count - 1]
+                                arrayContextStack.RemoveAt(arrayContextStack.Count - 1)
+                            else
+                                isInArrayContext <- false
+                            
+                            accumulatedData.Clear()
+                            
+                        | JsonToken.String | JsonToken.Integer | JsonToken.Float | JsonToken.Boolean ->
+                            if not (String.IsNullOrEmpty currentProperty) then
+                                accumulatedData.[currentProperty] <- reader.Value
+                                currentProperty <- ""
+                            
+                            let jsonPath = buildJsonPath pathStack reader.TokenType
+                            processJsonToken pool reader.TokenType reader.Value jsonPath accumulatedData
+                            
+                        | _ -> ()
+                    
+                    // Step 4: Signal completion to all channels
+                    for channel in pool.Channels do
+                        completeChannel channel
+                    
+                    // Step 5: Wait for all processing to complete
+                    do! Task.WhenAll(pool.ProcessingTasks)
+                    
+                    // Step 6: Final flush
+                    PhysicalDataStructures.flushIfNeeded pool.GlobalPredicateTable output (Dictionary<string, obj>())
+                    
+                with
+                | ex -> return failwithf "Error processing RML stream: %s" ex.Message
+            }
+
+    // Usage example (updated)
+    module RMLStreamUsage =
+        
+        open RMLStreamProcessor
+        
+        let runOptimizedRMLProcessing() =
+            task {
+                let json = """{"people": [{"id": "1", "name": "John Doe"}, {"id": "2", "name": "Jane Smith"}]}"""
+                use reader = new JsonTextReader(new StringReader(json))
+                
+                let triplesMaps = [| (* RML.Model.TriplesMap definitions *) |]
+                let output = 
+                    {
+                        new TripleOutputStream with
+                            member _.EmitTypedTriple(subject, predicate, objValue, datatype) =
+                                printfn "Typed Triple: %s %s %s %A" subject predicate objValue datatype
+                            member _.EmitLangTriple(subject, predicate, objValue, lang) =
+                                printfn "Lang Triple: %s %s %s @%s" subject predicate objValue lang
+                            member _.EmitTriple(subject, predicate, objValue) =
+                                printfn "Triple: %s %s %s" subject predicate objValue
+                    }
+                
+                do! processRMLStream reader triplesMaps output
+            }
