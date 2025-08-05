@@ -33,21 +33,11 @@ module Pipeline =
         Hash: uint64
     }
 
-    // Holds the token value
-    type TokenValue =
-    | StringValue of string
-    | IntegerValue of int64
-    | FloatValue of float
-    | BooleanValue of bool
-    | DateTimeValue of DateTime
-    | CompletionData of Dictionary<string, obj>
-    | StructuralToken  // For StartObject, StartArray, etc. that don't carry data
-
     // Token data for streaming
     [<Struct>]
     type StreamToken = {
         TokenType: JsonToken
-        Value: TokenValue
+        Value: obj
         Path: string
         Depth: int
         IsComplete: bool
@@ -470,40 +460,14 @@ module Pipeline =
                 ChildData = ConcurrentDictionary<string, obj>()
                 CurrentSize = 0
             }
-
-        let expandTemplate (template: string) (context: Dictionary<string, obj>) : string =
-            printfn "EXPANDING TEMPLATE: '%s' with context: %A" template context  // DEBUG
-            if not (template.Contains("{")) then
-                printfn "NO PLACEHOLDERS, returning: '%s'" template  // DEBUG
-                template
-            else
-                let mutable result = template
-                for kvp in context do
-                    let placeholder = "{" + kvp.Key + "}"
-                    if result.Contains(placeholder) then
-                        let oldResult = result
-                        result <- result.Replace(placeholder, kvp.Value.ToString())
-                        printfn "REPLACED '%s' -> '%s' in '%s'" placeholder (kvp.Value.ToString()) oldResult  // DEBUG
-                printfn "FINAL EXPANDED: '%s'" result  // DEBUG
-                result
         
         [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
         let addPredicateTuple (table: PredicateTupleTable) (tuple: PredicateTuple) (data: Dictionary<string, obj>) : bool =
-            // Expand templates with actual data to create the real triple key
-            let expandedSubject = expandTemplate tuple.SubjectTemplate data
-            let expandedPredicate = if tuple.IsConstant then tuple.PredicateValue else expandTemplate tuple.PredicateValue data
-            let expandedObject = if tuple.IsConstant then tuple.ObjectTemplate else expandTemplate tuple.ObjectTemplate data
-            
-            // Use the EXPANDED values for deduplication, not the templates
-            let key = sprintf "%s|%s|%s" expandedSubject expandedPredicate expandedObject
-            
-            printfn "DEDUPLICATION CHECK: Key='%s'" key  // DEBUG
+            let key = sprintf "%s|%s|%s" tuple.SubjectTemplate tuple.PredicateValue tuple.ObjectTemplate
             
             if table.DuplicateCheck.ContainsKey(key) then
-                printfn "DUPLICATE FOUND: Skipping key '%s'" key  // DEBUG
                 false
             else
-                printfn "NEW TRIPLE: Adding key '%s'" key  // DEBUG
                 table.DuplicateCheck.TryAdd(key, true) |> ignore
                 table.Tuples.TryAdd(tuple.Hash, tuple) |> ignore
                 Interlocked.Increment(&table.CurrentSize) |> ignore
@@ -521,31 +485,30 @@ module Pipeline =
         
         and processPredicateTuple (tuple: PredicateTuple) (output: TripleOutputStream) (context: Dictionary<string, obj>) : unit =
             try
-                printfn "PROCESSING PREDICATE TUPLE: %A" tuple  // DEBUG
-
                 let subject = expandTemplate tuple.SubjectTemplate context
                 let predicate = if tuple.IsConstant then tuple.PredicateValue else expandTemplate tuple.PredicateValue context
                 let objValue = if tuple.IsConstant then tuple.ObjectTemplate else expandTemplate tuple.ObjectTemplate context
                 
-                printfn "EMITTING TRIPLE: S='%s', P='%s', O='%s'" subject predicate objValue  // DEBUG
-
                 match tuple.ObjectDatatype with
-                | Some datatype -> 
-                    printfn "TYPED TRIPLE EMISSION"  // DEBUG
-                    output.EmitTypedTriple(subject, predicate, objValue, Some datatype)
+                | Some datatype -> output.EmitTypedTriple(subject, predicate, objValue, Some datatype)
                 | None ->
                     match tuple.ObjectLanguage with
-                    | Some lang -> 
-                        printfn "LANG TRIPLE EMISSION"  // DEBUG
-                        output.EmitLangTriple(subject, predicate, objValue, lang)
-                    | None -> 
-                        printfn "SIMPLE TRIPLE EMISSION"  // DEBUG
-                        output.EmitTriple(subject, predicate, objValue)
+                    | Some lang -> output.EmitLangTriple(subject, predicate, objValue, lang)
+                    | None -> output.EmitTriple(subject, predicate, objValue)
             with
-            | ex -> 
-                printfn "EXCEPTION in processPredicateTuple: %s" ex.Message  // DEBUG
-                ()
+            | _ -> ()
         
+        and expandTemplate (template: string) (context: Dictionary<string, obj>) : string =
+            if not (template.Contains("{")) then
+                template
+            else
+                let mutable result = template
+                for kvp in context do
+                    let placeholder = "{" + kvp.Key + "}"
+                    if result.Contains(placeholder) then
+                        result <- result.Replace(placeholder, kvp.Value.ToString())
+                result
+
     // Streaming Infrastructure
     module StreamInfrastructure =
         
@@ -611,30 +574,15 @@ module Pipeline =
                 let plan = pool.Plan.OrderedMaps.[mapIndex]
                 
                 if token.IsComplete then
-                    printfn "PROCESSING COMPLETION TOKEN for map %d" mapIndex
-                    
+                    // Process accumulated data for this iterator
                     let context = Dictionary<string, obj>()
                     
+                    // Extract data from token value if it's a dictionary
                     match token.Value with
-                    | CompletionData dict ->
-                        printfn "EXTRACTED COMPLETION DATA: %A with %d items" dict dict.Count
+                    | :? Dictionary<string, obj> as dict ->
                         for kvp in dict do
                             context.[kvp.Key] <- kvp.Value
-                    | StringValue s ->
-                        printfn "UNEXPECTED: Got StringValue in completion token: %s" s
-                    | IntegerValue i ->
-                        printfn "UNEXPECTED: Got IntegerValue in completion token: %d" i
-                    | FloatValue f ->
-                        printfn "UNEXPECTED: Got FloatValue in completion token: %f" f
-                    | BooleanValue b ->
-                        printfn "UNEXPECTED: Got BooleanValue in completion token: %b" b
-                    | DateTimeValue dt ->
-                        printfn "UNEXPECTED: Got DateTimeValue in completion token: %A" dt
-                    | StructuralToken ->
-                        printfn "COMPLETION TOKEN WITH STRUCTURAL DATA ONLY"
-                    
-                    printfn "FINAL CONTEXT: %A" context  // DEBUG
-                    printfn "PREDICATE TUPLES COUNT: %d" plan.PredicateTuples.Length  // DEBUG
+                    | _ -> ()
                     
                     // Process predicate tuples
                     for tuple in plan.PredicateTuples do
@@ -648,146 +596,38 @@ module Pipeline =
             )
     open StreamInfrastructure
 
-    // Enhanced Streaming Infrastructure with Producer-Consumer Pattern
-    module EnhancedStreamInfrastructure =
-        
-        open PhysicalDataStructures
-        open System.Threading.Channels
-        
-        // Add unique token ID for deduplication
-        [<Struct>]
-        type EnhancedStreamToken = {
-            TokenId: uint64  // Unique identifier
-            TokenType: JsonToken
-            Value: TokenValue
-            Path: string
-            Depth: int
-            IsComplete: bool
-            MapIndex: int  // Which map this token is specifically for
-        }
-        
-        // Enhanced channel with proper producer-consumer semantics
-        type EnhancedStreamChannel = {
-            Channel: Channel<EnhancedStreamToken>
-            Writer: ChannelWriter<EnhancedStreamToken>
-            Reader: ChannelReader<EnhancedStreamToken>
-            IsCompleted: bool ref
-            mutable ProcessedTokens: Set<uint64>  // Track processed token IDs
-        }
-
-        type EnhancedStreamingPool = {
-            Plan: RMLPlan
-            Channels: EnhancedStreamChannel[]
-            ProcessingTasks: Task[]
-            GlobalPredicateTable: PredicateTupleTable
-            GlobalJoinTable: PredicateJoinTable
-            Output: TripleOutputStream
-        }
-        
-        // Global token ID generator
-        let tokenIdGenerator = ref 0UL
-
-        let generateTokenId () =
-            System.Threading.Interlocked.Increment(tokenIdGenerator)
-        
-        // Create enhanced channel
-        let createEnhancedStreamChannel () : EnhancedStreamChannel =
-            let options = UnboundedChannelOptions()
-            options.SingleReader <- true  // Only one consumer per channel
-            options.SingleWriter <- false  // Multiple producers allowed
-            let channel = Channel.CreateUnbounded<EnhancedStreamToken>(options)
-            
-            {
-                Channel = channel
-                Writer = channel.Writer
-                Reader = channel.Reader
-                IsCompleted = ref false
-                ProcessedTokens = Set.empty
-            }
-        
-        // Enhanced token enqueue with deduplication
-        let enqueueEnhancedToken (channel: EnhancedStreamChannel) (token: EnhancedStreamToken) : bool =
-            if not (Set.contains token.TokenId channel.ProcessedTokens) then
-                let success = channel.Writer.TryWrite(token)
-                if success then
-                    channel.ProcessedTokens <- Set.add token.TokenId channel.ProcessedTokens
-                success
-            else
-                false  // Already processed
-        
-        // Signal completion to enhanced channel
-        let completeEnhancedChannel (channel: EnhancedStreamChannel) : unit =
-            channel.IsCompleted := true
-            channel.Writer.Complete()
-        
-        // Create single-consumer processing task for each channel
-        let createChannelProcessor (mapIndex: int) (channel: EnhancedStreamChannel) (pool: StreamingPool) : Task =
-            Task.Run(fun () ->
-                task {
-                    let plan = pool.Plan.OrderedMaps.[mapIndex]
-                    
-                    // Single consumer loop - each token processed exactly once
-                    while not (!(channel.IsCompleted)) || channel.Reader.Count > 0 do
-                        let! hasToken = channel.Reader.WaitToReadAsync()
-                        
-                        if hasToken then
-                            while channel.Reader.TryRead() do
-                                let token = channel.Reader.Current
-                                
-                                // Process only completion tokens for this specific map
-                                if token.IsComplete && token.MapIndex = mapIndex then
-                                    printfn "PROCESSING COMPLETION TOKEN %d for map %d (UNIQUE)" token.TokenId mapIndex
-                                    
-                                    let context = Dictionary<string, obj>()
-                                    
-                                    match token.Value with
-                                    | CompletionData dict ->
-                                        printfn "EXTRACTED COMPLETION DATA: %A with %d items" dict dict.Count
-                                        for kvp in dict do
-                                            context.[kvp.Key] <- kvp.Value
-                                    | _ -> ()
-                                    
-                                    printfn "FINAL CONTEXT: %A" context
-                                    printfn "PREDICATE TUPLES COUNT: %d" plan.PredicateTuples.Length
-                                    
-                                    // Process predicate tuples (this is where actual work happens)
-                                    for tuple in plan.PredicateTuples do
-                                        if addPredicateTuple pool.GlobalPredicateTable tuple context then
-                                            flushIfNeeded pool.GlobalPredicateTable pool.Output context
-                                    
-                                    // Process join tuples
-                                    for joinTuple in plan.JoinTuples do
-                                        processPredicateTuple joinTuple.ParentTuple pool.Output context
-                                        processPredicateTuple joinTuple.ChildTuple pool.Output context
-                }
-            )
-
     // Stream Processor
     module StreamProcessor =
         
-        open EnhancedStreamInfrastructure
+        open StreamInfrastructure
         open PhysicalDataStructures
         
         // Initialize streaming pool with channels for each dependency group
-        let createEnhancedStreamingPool (triplesMaps: TriplesMap[]) (output: TripleOutputStream) : EnhancedStreamingPool =
+        let createStreamingPool (triplesMaps: TriplesMap[]) (output: TripleOutputStream) : StreamingPool =
             let plan = RMLPlanner.createRMLPlan triplesMaps
-            let channels = Array.init plan.OrderedMaps.Length (fun _ -> createEnhancedStreamChannel())
+            let channels = Array.init plan.OrderedMaps.Length (fun _ -> createStreamChannel())
             let globalPredicateTable = createPredicateTupleTable 1000
             let globalJoinTable = createPredicateJoinTable()
             
-            // Create a single processing task per channel (one consumer per channel)
+            // Create processing tasks for each dependency group
             let processingTasks = 
-                channels
-                |> Array.mapi (fun mapIndex channel ->
-                    createChannelProcessor mapIndex channel 
-                        {
-                            Plan = plan
-                            Channels = [||]  // Not used in new design
-                            ProcessingTasks = [||]
-                            GlobalPredicateTable = globalPredicateTable
-                            GlobalJoinTable = globalJoinTable
-                            Output = output
-                        })
+                plan.DependencyGroups
+                |> Array.mapi (fun groupIdx group ->
+                    Task.Run(fun () ->
+                        let processingStream = 
+                            createProcessingStream groupIdx group 
+                                { 
+                                    Plan = plan
+                                    Channels = channels
+                                    ProcessingTasks = [||] // Will be set after creation
+                                    GlobalPredicateTable = globalPredicateTable
+                                    GlobalJoinTable = globalJoinTable
+                                    Output = output
+                                }
+
+                        // Start lazy processing - only begins when tokens arrive
+                        processingStream |> ParStream.iter id
+                    ))
             
             {
                 Plan = plan
@@ -798,63 +638,12 @@ module Pipeline =
                 Output = output
             }
         
-        let processEnhancedJsonToken (pool: EnhancedStreamingPool) (tokenType: JsonToken) (value: obj) (currentPath: string) (accumulatedData: Dictionary<string, obj>) : unit =
-            // Only process completion tokens to avoid unnecessary work
-            if tokenType = JsonToken.EndObject || tokenType = JsonToken.EndArray then
-                let tokenId = generateTokenId()
-                
-                printfn "Trying to match path: '%s'" currentPath
-                
-                // Route to appropriate channels based on path matching
-                match FastMap.tryFind currentPath pool.Plan.PathToMaps with
-                | ValueSome mapIndices ->
-                    printfn "MATCH FOUND! Path '%s' matched indices: %A" currentPath mapIndices
-                    
-                    // Create ONE token per matching map (not shared tokens)
-                    for mapIndex in mapIndices do
-                        let channel = pool.Channels.[mapIndex]
-                        
-                        let enhancedToken = {
-                            TokenId = tokenId + uint64 mapIndex  // Unique ID per map
-                            TokenType = tokenType
-                            Value = CompletionData(Dictionary<string, obj>(accumulatedData))
-                            Path = currentPath
-                            Depth = currentPath.Split('.').Length
-                            IsComplete = true
-                            MapIndex = mapIndex
-                        }
-                        
-                        let enqueued = enqueueEnhancedToken channel enhancedToken
-                        printfn "ENQUEUED TOKEN %d for map %d: %b" enhancedToken.TokenId mapIndex enqueued
-                        
-                | ValueNone -> 
-                    printfn "NO MATCH for path: '%s'" currentPath
-
         // Process JSON token and route to appropriate streams
         [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
         let processJsonToken (pool: StreamingPool) (tokenType: JsonToken) (value: obj) (currentPath: string) (accumulatedData: Dictionary<string, obj>) : unit =
-            let tokenValue = 
-                match tokenType with
-                | JsonToken.String -> 
-                    StringValue(value :?> string)
-                | JsonToken.Integer -> 
-                    IntegerValue(value :?> int64)
-                | JsonToken.Float -> 
-                    FloatValue(value :?> float)
-                | JsonToken.Boolean -> 
-                    BooleanValue(value :?> bool)
-                | JsonToken.Date -> 
-                    DateTimeValue(value :?> DateTime)
-                | JsonToken.EndObject | JsonToken.EndArray -> 
-                    CompletionData(Dictionary<string, obj>(accumulatedData))
-                | JsonToken.StartObject | JsonToken.StartArray | JsonToken.PropertyName ->
-                    StructuralToken
-                | _ -> 
-                    StructuralToken  // Default for other tokens
-            
             let token = {
                 TokenType = tokenType
-                Value = tokenValue
+                Value = value
                 Path = currentPath
                 Depth = currentPath.Split('.').Length
                 IsComplete = (tokenType = JsonToken.EndObject || tokenType = JsonToken.EndArray)
@@ -869,9 +658,6 @@ module Pipeline =
                 printfn "MATCH FOUND! Path '%s' matched indices: %A" currentPath mapIndices
                 for mapIndex in mapIndices do
                     let channel = pool.Channels.[mapIndex]
-
-                    printfn "ENQUEUING TOKEN: Type=%A, IsComplete=%b, Value=%A" 
-                        tokenType token.IsComplete value
                     
                     // Mark channel as started and enqueue token
                     if not channel.IsStarted then
@@ -880,8 +666,7 @@ module Pipeline =
                     // For completion tokens, include accumulated data
                     let finalToken = 
                         if token.IsComplete then
-                            printfn "COMPLETION TOKEN DATA: %A" accumulatedData  // DEBUG                
-                            { token with Value = (CompletionData accumulatedData) }
+                            { token with Value = accumulatedData :> obj }
                         else
                             token
                     
@@ -894,8 +679,7 @@ module Pipeline =
         
         open StreamProcessor
         
-        // In RMLStreamProcessor module, replace the existing function:
-        let processRMLStreamEnhanced 
+        let processRMLStream 
                 (reader: JsonTextReader) 
                 (triplesMaps: TriplesMap[]) 
                 (output: TripleOutputStream) : Task<unit> =
@@ -904,8 +688,8 @@ module Pipeline =
                 reader.SupportMultipleContent <- true
                 reader.DateParseHandling <- DateParseHandling.None
                 
-                // Step 1: Initialize enhanced streaming pool
-                let pool = EnhancedStreamProcessor.createEnhancedStreamingPool triplesMaps output
+                // Step 1: Initialize streaming pool (pre-processing phase)
+                let pool = createStreamingPool triplesMaps output
                 
                 // DEBUG: Print what paths are in the PathToMaps index
                 printfn "=== PathToMaps Index ==="
@@ -914,14 +698,15 @@ module Pipeline =
                     printfn "Path: '%s' -> Indices: %A" path indices)
                 printfn "========================"
                 
-                // Step 2: [Keep your existing JSON parsing logic exactly as is]
+                // Step 2: Track JSON parsing state
                 let pathStack = ResizeArray<string>()
                 let accumulatedData = Dictionary<string, obj>()
                 let mutable currentProperty = ""
                 let mutable isInArray = false
-                let mutable arrayDepth = 0
-                let contextStack = ResizeArray<bool * string * int>()
+                let mutable arrayDepth = 0  // Track how deep we are in arrays
+                let contextStack = ResizeArray<bool * string * int>() // (isArray, propertyName, arrayDepth)
                 
+                // Helper function to build proper JSONPath syntax for routing
                 let buildCurrentPath () =
                     if pathStack.Count = 0 then 
                         "$"
@@ -930,14 +715,14 @@ module Pipeline =
                         if isInArray then basePath + "[*]" else basePath
                 
                 try
-                    // Step 3: Use enhanced token processing
+                    // Step 3: Stream JSON tokens to parallel processors
                     while reader.Read() do
                         let currentPath = buildCurrentPath()
                         
                         match reader.TokenType with
                         | JsonToken.StartObject ->
                             printfn "StartObject - Path: '%s'" currentPath
-                            // Only process structural tokens if needed
+                            processJsonToken pool reader.TokenType reader.Value currentPath accumulatedData
                             
                         | JsonToken.StartArray ->
                             contextStack.Add((isInArray, currentProperty, arrayDepth))
@@ -945,11 +730,14 @@ module Pipeline =
                             arrayDepth <- arrayDepth + 1
                             let arrayPath = buildCurrentPath()
                             printfn "StartArray - Path: '%s'" arrayPath
+                            processJsonToken pool reader.TokenType reader.Value arrayPath accumulatedData
                             
                         | JsonToken.PropertyName ->
                             let propName = reader.Value :?> string
                             currentProperty <- propName
                             
+                            // Only add to pathStack if we're not inside an array item
+                            // Properties inside array items should not affect the routing path
                             if not isInArray then
                                 pathStack.Add(propName)
                             
@@ -959,9 +747,12 @@ module Pipeline =
                             let endPath = buildCurrentPath()
                             printfn "EndObject - Path: '%s'" endPath
                             
-                            // ONLY process completion tokens
-                            EnhancedStreamProcessor.processEnhancedJsonToken pool reader.TokenType reader.Value endPath accumulatedData
+                            // Send completion token with accumulated data
+                            let dataClone = Dictionary<string, obj>(accumulatedData)
+                            processJsonToken pool reader.TokenType dataClone endPath dataClone
                             
+                            // Clean up path stack only if we're not inside an array
+                            // (properties inside arrays don't add to pathStack)
                             if not isInArray && pathStack.Count > 0 then
                                 pathStack.RemoveAt(pathStack.Count - 1)
                             
@@ -969,10 +760,11 @@ module Pipeline =
                             let endPath = buildCurrentPath()
                             printfn "EndArray - Path: '%s'" endPath
                             
-                            // ONLY process completion tokens
-                            EnhancedStreamProcessor.processEnhancedJsonToken pool reader.TokenType reader.Value endPath accumulatedData
+                            // Send completion token with accumulated data
+                            let dataClone = Dictionary<string, obj>(accumulatedData)
+                            processJsonToken pool reader.TokenType dataClone endPath dataClone
                             
-                            // [Keep your existing cleanup logic]
+                            // Restore previous context
                             if contextStack.Count > 0 then
                                 let (prevIsArray, prevProperty, prevArrayDepth) = contextStack.[contextStack.Count - 1]
                                 contextStack.RemoveAt(contextStack.Count - 1)
@@ -983,32 +775,25 @@ module Pipeline =
                                 isInArray <- false
                                 arrayDepth <- 0
                             
+                            // Remove the array property from pathStack (e.g., "people")
                             if pathStack.Count > 0 then
                                 pathStack.RemoveAt(pathStack.Count - 1)
                             
                             accumulatedData.Clear()
                             
-                        | JsonToken.String | JsonToken.Integer | JsonToken.Float | JsonToken.Boolean | JsonToken.Date ->
+                        | JsonToken.String | JsonToken.Integer | JsonToken.Float | JsonToken.Boolean ->
                             if not (String.IsNullOrEmpty currentProperty) then
-                                let typedValue = 
-                                    match reader.TokenType with
-                                    | JsonToken.String -> box (reader.Value :?> string)
-                                    | JsonToken.Integer -> box (reader.Value :?> int64) 
-                                    | JsonToken.Float -> box (reader.Value :?> float)
-                                    | JsonToken.Boolean -> box (reader.Value :?> bool)
-                                    | JsonToken.Date -> box (reader.Value :?> DateTime)
-                                    | _ -> reader.Value
-                                
-                                accumulatedData.[currentProperty] <- typedValue
+                                accumulatedData.[currentProperty] <- reader.Value
                                 currentProperty <- ""
                             
                             printfn "Value token - Path: '%s', Value: %A" currentPath reader.Value
+                            processJsonToken pool reader.TokenType reader.Value currentPath accumulatedData
                             
                         | _ -> ()
                     
-                    // Step 4: Signal completion to all enhanced channels
+                    // Step 4: Signal completion to all channels
                     for channel in pool.Channels do
-                        completeEnhancedChannel channel
+                        completeChannel channel
                     
                     // Step 5: Wait for all processing to complete
                     do! Task.WhenAll(pool.ProcessingTasks)
@@ -1042,5 +827,5 @@ module Pipeline =
                                 printfn "Triple: %s %s %s" subject predicate objValue
                     }
                 
-                do! processRMLStreamEnhanced reader triplesMaps output
+                do! processRMLStream reader triplesMaps output
             }
