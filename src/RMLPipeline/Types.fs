@@ -5,8 +5,7 @@ open RMLPipeline.FastMap.Types
 open Newtonsoft.Json
 
 module Core =
-    
-    // Primary value type - similar to your MorkSharp Scalar but optimized for RML
+       
     type RMLValue =
         | StringValue of string
         | IntValue of int64        // Use int64 to handle all integer types
@@ -14,9 +13,9 @@ module Core =
         | BoolValue of bool
         | DateTimeValue of DateTime
         | DecimalValue of decimal
-        | NullValue
         | ArrayValue of RMLValue array
         | ObjectValue of FastMap<string, RMLValue>
+        | NullValue
 
         member this.IsNull =
             match this with NullValue -> true | _ -> false
@@ -47,6 +46,17 @@ module Core =
             | :? DateTime as dt -> Some (DateTimeValue dt)
             | :? decimal as d -> Some (DecimalValue d)
             | _ -> None
+
+    let rmlValueOf<'t> (value: 't) : RMLValue option =
+        match box value with
+        // | :? array<byte> as bytes -> BinValue bytes |> Some
+        | :? bool as b -> BoolValue b |> Some
+        | :? string as s -> StringValue s |> Some
+        | :? int as i -> IntValue i |> Some
+        | :? int64 as l -> IntValue l |> Some
+        | :? float as f -> FloatValue f |> Some
+        | :? decimal as d -> DecimalValue d |> Some
+        | _ -> None
 
     // Type-safe context - replaces Dictionary<string, obj>
     [<Struct>]
@@ -100,7 +110,7 @@ module Core =
 
     // Type-safe stream token
     [<Struct>]
-    type TypedStreamToken = {
+    type StreamToken = {
         TokenType: JsonToken
         Value: RMLValue
         Path: string
@@ -109,15 +119,14 @@ module Core =
         Context: Context option
     }
     
-    module TypedStreamToken =
-        let create tokenType value path isComplete context = {
-            TokenType = tokenType
-            Value = value
-            Path = path
-            Depth = path.Split('.').Length
-            IsComplete = isComplete
-            Context = context
-        }
+    let mkStreamToken tokenType value path isComplete context = {
+        TokenType = tokenType
+        Value = value
+        Path = path
+        Depth = path.Split('.').Length
+        IsComplete = isComplete
+        Context = context
+    }
         
         (* let fromLegacyToken (legacyToken: StreamToken) : TypedStreamToken =
             let rmlValue = 
@@ -131,3 +140,60 @@ module Core =
                 IsComplete = legacyToken.IsComplete
                 Context = None
             } *)
+
+    // Template expansion errors
+    type TemplateError =
+        | MissingPlaceholder of placeholder: string
+        | InvalidValueType of placeholder: string * expected: string * actual: string
+        | TemplateParseError of template: string * error: string
+    
+    // Template expansion result
+    type TemplateResult =
+        | Success of string
+        | Error of TemplateError
+    
+
+    // Enhanced predicate tuple with type safety
+    [<Struct>]
+    type PredicateTuple = {
+        SubjectTemplate: string
+        PredicateValue: string
+        ObjectTemplate: string
+        ObjectDatatype: XsdType option
+        ObjectLanguage: string option
+        IsConstant: bool
+        SourcePath: string
+        Hash: uint64
+        ExpectedValueTypes: RMLValueType Set  // What types we expect in the context
+    }
+    
+    and RMLValueType =
+        | StringType
+        | IntType  
+        | FloatType
+        | BoolType
+        | DateTimeType
+        | DecimalType
+        | ArrayType of RMLValueType
+        | ObjectType
+    
+    and XsdType =
+        | XsdString
+        | XsdInt
+        | XsdFloat
+        | XsdBoolean
+        | XsdDateTime
+        | XsdDecimal
+        | XsdDouble
+        | XsdAnyUri
+        | XsdDate
+        | XsdTime
+        | XsdDuration
+        | XsdBase64Binary
+        | XsdHexBinary
+        | XsdAnyType
+    
+    // Type-safe triple generation
+    type TripleGenerationResult =
+        | TripleGenerated of subject: string * predicate: string * object: string * datatype: XsdType option
+        | TripleGenerationError of error: TemplateError

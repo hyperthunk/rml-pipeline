@@ -9,6 +9,7 @@
     <Compile Include="FastMap.fs" />
     <Compile Include="Model.fs" />
     <Compile Include="Types.fs" />
+    <Compile Include="Templates.fs" />
     <Compile Include="DSL.fs" />
     <Compile Include="Pipeline.fs" />
   </ItemGroup>
