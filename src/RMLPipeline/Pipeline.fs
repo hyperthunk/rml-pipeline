@@ -681,15 +681,16 @@ module Pipeline =
                                 // Process the token
                                 let context = Dictionary<string, obj>()
                                 
-                                // Process predicate tuples  
-                                for tuple in pool.Plan.PredicateTuples do
-                                    if addPredicateTuple pool.GlobalPredicateTable tuple context then
-                                        flushIfNeeded pool.GlobalPredicateTable pool.Output context
-                                
-                                // Process join tuples
-                                for joinTuple in pool.Plan.JoinTuples do
-                                    processPredicateTuple joinTuple.ParentTuple pool.Output context
-                                    processPredicateTuple joinTuple.ChildTuple pool.Output context
+                                // Process predicate tuples from all ordered maps
+                                for mapPlan in pool.Plan.OrderedMaps do
+                                    for tuple in mapPlan.PredicateTuples do
+                                        if addPredicateTuple pool.GlobalPredicateTable tuple context then
+                                            flushIfNeeded pool.GlobalPredicateTable pool.Output context
+                                    
+                                    // Process join tuples for this map
+                                    for joinTuple in mapPlan.JoinTuples do
+                                        processPredicateTuple joinTuple.ParentTuple pool.Output context
+                                        processPredicateTuple joinTuple.ChildTuple pool.Output context
                     
                     if not hasData then
                         // Check if all channels in group are completed
@@ -697,8 +698,8 @@ module Pipeline =
                         if allCompleted then
                             shouldContinue <- false
                         else
-                            // Brief wait before checking again
-                            Thread.Sleep(1)
+                            // Brief pause to yield CPU before checking again
+                            SpinWait.SpinUntil(fun () -> false, 1)
             )
         
         // Initialize enhanced streaming pool with channels for each dependency group
@@ -748,7 +749,7 @@ module Pipeline =
             // Route to appropriate channels based on path matching
             for mapIndex in 0 .. pool.Plan.OrderedMaps.Length - 1 do
                 let map = pool.Plan.OrderedMaps.[mapIndex]
-                if currentPath.StartsWith(map.LogicalSource.SourcePath) then
+                if currentPath.StartsWith(map.LogicalSource.Path |> Option.defaultValue "") then
                     let channel = pool.Channels.[mapIndex]
                     
                     // Mark channel as started and enqueue token
@@ -962,7 +963,7 @@ module Pipeline =
                         completeChannel channel
                     
                     // Step 5: Wait for all processing to complete
-                    do! Task.WhenAll(pool.ProcessingTasks)
+                    let! _ = Task.WhenAll(pool.ProcessingTasks)
                     
                     // Step 6: Final flush
                     PhysicalDataStructures.flushIfNeeded pool.GlobalPredicateTable output (Dictionary<string, obj>())
