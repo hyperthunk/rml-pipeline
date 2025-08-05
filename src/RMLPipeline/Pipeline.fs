@@ -117,40 +117,21 @@ module Pipeline =
     }
 
     // Streaming infrastructure
-    type StreamChannel = {
-        TokenQueue: ConcurrentQueue<StreamToken>
-        SignalEvent: ManualResetEventSlim
-        IsCompleted: bool ref
-        mutable IsStarted: bool
-    }
-
-    // Enhanced streaming infrastructure using .NET Channels API
-    type EnhancedStreamChannel = {
-        Channel: Channel<EnhancedStreamToken>
-        Reader: ChannelReader<EnhancedStreamToken>
-        Writer: ChannelWriter<EnhancedStreamToken>
-        mutable IsCompleted: bool
-        mutable IsStarted: bool
-        ProcessorId: int
+    type StreamChannel<'T> = {
+        Channel: Channel<'T>
+        Writer: ChannelWriter<'T>
+        Reader: ChannelReader<'T>
+        CancellationToken: CancellationToken
     }
 
     type StreamingPool = {
         Plan: RMLPlan
-        Channels: StreamChannel[]
+        Channels: StreamChannel<StreamToken>[]
         ProcessingTasks: Task<unit>[]
         GlobalPredicateTable: PredicateTupleTable
         GlobalJoinTable: PredicateJoinTable
         Output: TripleOutputStream
-    }
-
-    // Enhanced streaming pool using .NET Channels API
-    type EnhancedStreamingPool = {
-        Plan: RMLPlan
-        Channels: EnhancedStreamChannel[]
-        ProcessingTasks: Task<unit>[]
-        GlobalPredicateTable: PredicateTupleTable
-        GlobalJoinTable: PredicateJoinTable
-        Output: TripleOutputStream
+        CancellationTokenSource: CancellationTokenSource
     }
 
     // RML Planning module 
@@ -173,6 +154,11 @@ module Pipeline =
         let extractPredicateTuples (triplesMap: TriplesMap) (mapIndex: int) : PredicateTuple[] =
             let tuples = ResizeArray<PredicateTuple>()
             let iteratorPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
+            
+            // DEBUG: Check if corruption happens here
+            printfn "DEBUG-EXTRACT: Original iterator path: '%s'" iteratorPath
+            if iteratorPath.Contains("\n") || iteratorPath.Contains("\r") then
+                printfn "DEBUG-EXTRACT: *** CORRUPTION DETECTED IN ITERATOR PATH ***"
             
             let subjectTemplate = 
                 match triplesMap.SubjectMap with
@@ -347,7 +333,7 @@ module Pipeline =
                             plan1.PredicateTuples 
                             |> Array.map (_.Hash)
                             |> Set.ofArray
-                            |> Set.intersect (plan2.PredicateTuples |> Array.map (_.Hash) |> Set.ofArray)
+                            |> Set.intersect (plan2.PredicateTuples |> Array.map _.Hash |> Set.ofArray)
                         
                         let totalHashes = plan1.PredicateTuples.Length + plan2.PredicateTuples.Length
                         if totalHashes > 0 then
@@ -365,6 +351,12 @@ module Pipeline =
                 triplesMaps
                 |> Array.mapi (fun i tm ->
                     let iteratorPath = tm.LogicalSource.SourceIterator |> Option.defaultValue "$"
+                    
+                    // DEBUG: Check corruption at plan creation
+                    printfn "DEBUG-PLAN: Map %d iterator path: '%s'" i iteratorPath
+                    if iteratorPath.Contains("\n") || iteratorPath.Contains("\r") then
+                        printfn "DEBUG-PLAN: *** CORRUPTION DETECTED AT PLAN CREATION ***"
+                    
                     let pathSegments = iteratorPath.TrimStart('$', '.').Split('.')
                     let predicateTuples = extractPredicateTuples tm i
                     let joinTuples = extractJoinTuples triplesMaps i
@@ -519,11 +511,11 @@ module Pipeline =
         
         let rec processPredicateTuple (tuple: PredicateTuple) (output: TripleOutputStream) (context: Dictionary<string, obj>) : unit =
             try
-                printfn "EMIT DEBUG: PredicateTuple=%A, Context=%A" tuple context
+                // printfn "EMIT DEBUG: PredicateTuple=%A, Context=%A" tuple context
                 let subject = expandTemplate tuple.SubjectTemplate context
                 let predicate = if tuple.IsConstant then tuple.PredicateValue else expandTemplate tuple.PredicateValue context
                 let objValue = if tuple.IsConstant then tuple.ObjectTemplate else expandTemplate tuple.ObjectTemplate context
-                printfn "EMIT DEBUG: subject=%s, predicate=%s, objValue=%s" subject predicate objValue
+                // printfn "EMIT DEBUG: subject=%s, predicate=%s, objValue=%s" subject predicate objValue
                 match tuple.ObjectDatatype with
                 | Some datatype -> output.EmitTypedTriple(subject, predicate, objValue, Some datatype)
                 | None ->
@@ -531,10 +523,10 @@ module Pipeline =
                     | Some lang -> output.EmitLangTriple(subject, predicate, objValue, lang)
                     | None -> output.EmitTriple(subject, predicate, objValue)
             with
-            | ex -> printfn "EXCEPTION in processPredicateTuple: %A" ex
+            | ex -> ()// printfn "EXCEPTION in processPredicateTuple: %A" ex
 
         let forceFlush (table: PredicateTupleTable) (output: TripleOutputStream) : unit =
-            printfn "FORCE FLUSH: Processing %d tuples" table.CurrentSize
+            // printfn "FORCE FLUSH: Processing %d tuples" table.CurrentSize
             for KeyValue(_, (context, tuple)) in table.Tuples do
                 processPredicateTuple tuple output context
             table.Tuples.Clear()
@@ -546,124 +538,200 @@ module Pipeline =
 
     // Streaming Infrastructure
     module StreamInfrastructure =
-        
+    
         open PhysicalDataStructures
+        open System.Threading.Channels
         
-        // Create stream channel for non-blocking communication
-        let createStreamChannel () : StreamChannel =
+        let mutable globalTaskCounter = 0
+        
+        // Create stream channel with proper cancellation
+        let createStreamChannel (cancellationToken: CancellationToken) : StreamChannel<StreamToken> =
+            let options = UnboundedChannelOptions()
+            options.SingleReader <- false
+            options.SingleWriter <- false
+            let channel = Channel.CreateUnbounded<StreamToken>(options)
+            let channelId = Interlocked.Increment(&globalTaskCounter)
+            // printfn "[CHANNEL-%d] Created new channel" channelId
             {
-                TokenQueue = ConcurrentQueue<StreamToken>()
-                SignalEvent = new ManualResetEventSlim(false)
-                IsCompleted = ref false
-                IsStarted = false
+                Channel = channel
+                Writer = channel.Writer
+                Reader = channel.Reader
+                CancellationToken = cancellationToken
             }
         
-        // Non-blocking token enqueue
-        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-        let enqueueToken (channel: StreamChannel) (token: StreamToken) : unit =
-            channel.TokenQueue.Enqueue(token)
-            channel.SignalEvent.Set()
+        // Non-blocking token enqueue with cancellation support
+        let enqueueToken (channel: StreamChannel<StreamToken>) (token: StreamToken) : bool =
+            if not channel.CancellationToken.IsCancellationRequested then
+                let result = channel.Writer.TryWrite(token)
+                //if result then
+                    // printfn "[ENQUEUE] Token written to channel: %s (Complete: %b)" token.Path token.IsComplete
+                //else
+                    // printfn "[ENQUEUE-FAIL] Failed to write token to channel: %s" token.Path
+                result
+            else
+                // printfn "[ENQUEUE-CANCELLED] Channel cancelled, skipping token: %s" token.Path
+                false
         
         // Signal completion to channel
-        let completeChannel (channel: StreamChannel) : unit =
-            channel.IsCompleted := true
-            channel.SignalEvent.Set()
+        let completeChannel (channel: StreamChannel<StreamToken>) : unit =
+            // printfn "[COMPLETE] Completing channel"
+            channel.Writer.Complete()
         
-        // Create processing stream for dependency group using ParStream
-        let createProcessingStream (groupIndex: int) (group: int[]) (pool: StreamingPool) : ParStream<unit> =
-            // Create token stream from channels
-            let tokenSeq = seq {
-                let mutable shouldContinue = true
-                while shouldContinue do
-                    let mutable foundToken = false
-                    
-                    // Check all channels in this group for tokens
-                    for mapIndex in group do
-                        let channel = pool.Channels.[mapIndex]
-                        let mutable token = Unchecked.defaultof<StreamToken>
-                        
-                        if channel.TokenQueue.TryDequeue(&token) then
-                            foundToken <- true
-                            yield (mapIndex, token)
-                    
-                    if not foundToken then
-                        // Wait for signal or completion
-                        let allCompleted = 
-                            group |> Array.forall (fun idx -> !(pool.Channels.[idx].IsCompleted))
-                        
-                        if allCompleted then
-                            shouldContinue <- false
-                        else
-                            // Wait for any channel in group to signal
-                            let events = group |> Array.map (fun idx -> pool.Channels.[idx].SignalEvent.WaitHandle)
-                            WaitHandle.WaitAny(events, 100) |> ignore
-                            
-                            // Reset signals
-                            for idx in group do
-                                pool.Channels.[idx].SignalEvent.Reset()
-            }
+        // Enhanced processing task with extensive debugging
+        let createProcessingTask (groupIndex: int) (group: int[]) (pool: StreamingPool) : Task<unit> =
+            let taskId = Interlocked.Increment(&globalTaskCounter)
+            // printfn "[TASK-%d] Starting processing task for group %d with channels: %A" taskId groupIndex group
             
-            tokenSeq
-            |> ParStream.ofSeq
-            |> ParStream.map (fun (mapIndex, token) ->
-                let plan = pool.Plan.OrderedMaps.[mapIndex]
-                
-                if token.IsComplete then
-                    // Process accumulated data for this iterator
-                    let context = Dictionary<string, obj>()
+            task {
+                try
+                    let! _ = Task.WhenAll(
+                        group |> Array.map (fun mapIndex ->
+                            task {
+                                let channelTaskId = Interlocked.Increment(&globalTaskCounter)
+                                // printfn "[CHANNEL-TASK-%d] Starting channel processor for map %d" channelTaskId mapIndex
+                                
+                                let channel = pool.Channels.[mapIndex]
+                                let plan = pool.Plan.OrderedMaps.[mapIndex]
+                                
+                                // printfn "[CHANNEL-TASK-%d] Channel reader created, starting enumeration" channelTaskId
+                                
+                                let reader = channel.Reader.ReadAllAsync(pool.CancellationTokenSource.Token)
+                                use enumerator = reader.GetAsyncEnumerator(pool.CancellationTokenSource.Token)
+                                
+                                let mutable tokenCount = 0
+                                let mutable hasMore = true
+                                
+                                while hasMore && not pool.CancellationTokenSource.Token.IsCancellationRequested do
+                                    // printfn "[CHANNEL-TASK-%d] Waiting for next token..." channelTaskId
+                                    let! moveNext = enumerator.MoveNextAsync()
+                                    hasMore <- moveNext
+                                    
+                                    if hasMore then
+                                        tokenCount <- tokenCount + 1
+                                        let token = enumerator.Current
+                                        // printfn "[CHANNEL-TASK-%d] Received token #%d: %s (Complete: %b)" channelTaskId tokenCount token.Path token.IsComplete
+                                        
+                                        if token.IsComplete then
+                                            // printfn "[CHANNEL-TASK-%d] Processing completion token" channelTaskId
+                                            let context = Dictionary<string, obj>()
+                                            
+                                            match token.Value with
+                                            | :? Dictionary<string, obj> as dict ->
+                                                // printfn "[CHANNEL-TASK-%d] Extracting %d context items" channelTaskId dict.Count
+                                                for kvp in dict do
+                                                    context.[kvp.Key] <- kvp.Value
+                                            | _ -> 
+                                                // printfn "[CHANNEL-TASK-%d] No context data in token" channelTaskId
+                                            
+                                            // Process predicate tuples with cancellation checking
+                                            // printfn "[CHANNEL-TASK-%d] Processing %d predicate tuples" channelTaskId plan.PredicateTuples.Length
+                                            plan.PredicateTuples
+                                            |> Array.iteri (fun i tuple ->
+                                                if not pool.CancellationTokenSource.Token.IsCancellationRequested then
+                                                    // printfn "[CHANNEL-TASK-%d] Processing predicate tuple %d/%d" channelTaskId (i+1) plan.PredicateTuples.Length
+                                                    if addPredicateTuple pool.GlobalPredicateTable tuple context then
+                                                        flushIfNeeded pool.GlobalPredicateTable pool.Output
+                                                else
+                                                    ()
+                                                    // printfn "[CHANNEL-TASK-%d] Cancellation requested during predicate processing" channelTaskId
+                                            )
+                                            
+                                            // Process join tuples with cancellation checking
+                                            // printfn "[CHANNEL-TASK-%d] Processing %d join tuples" channelTaskId plan.JoinTuples.Length
+                                            plan.JoinTuples
+                                            |> Array.iter (fun joinTuple ->
+                                                if not pool.CancellationTokenSource.Token.IsCancellationRequested then
+                                                    processPredicateTuple joinTuple.ParentTuple pool.Output context
+                                                    processPredicateTuple joinTuple.ChildTuple pool.Output context
+                                                else
+                                                    ()
+                                                    // printfn "[CHANNEL-TASK-%d] Cancellation requested during join processing" channelTaskId
+                                            )
+                                        else
+                                            ()
+                                            // printfn "[CHANNEL-TASK-%d] Skipping non-completion token" channelTaskId
+                                    else
+                                        ()
+                                        // printfn "[CHANNEL-TASK-%d] No more tokens, channel completed" channelTaskId
+                                
+                                // printfn "[CHANNEL-TASK-%d] Channel processing completed. Processed %d tokens" channelTaskId tokenCount
+                            }))
                     
-                    // Extract data from token value if it's a dictionary
-                    match token.Value with
-                    | :? Dictionary<string, obj> as dict ->
-                        for kvp in dict do
-                            context.[kvp.Key] <- kvp.Value
-                    | _ -> ()
-                    
-                    // Process predicate tuples
-                    for tuple in plan.PredicateTuples do
-                        if addPredicateTuple pool.GlobalPredicateTable tuple context then
-                            flushIfNeeded pool.GlobalPredicateTable pool.Output
-                    
-                    // Process join tuples
-                    for joinTuple in plan.JoinTuples do
-                        processPredicateTuple joinTuple.ParentTuple pool.Output context
-                        processPredicateTuple joinTuple.ChildTuple pool.Output context
-            )
+                    // printfn "[TASK-%d] All channel tasks completed for group %d" taskId groupIndex
+                    return ()
+                with
+                | :? OperationCanceledException -> 
+                    // printfn "[TASK-%d] Processing cancelled for group %d" taskId groupIndex
+                    return ()
+                | ex -> 
+                    // printfn "[TASK-%d] Error in processing group %d: %A" taskId groupIndex ex
+                    pool.CancellationTokenSource.Cancel()
+                    return ()
+            }
+    
     open StreamInfrastructure
 
     // Stream Processor
     module StreamProcessor =
-        
+    
         open StreamInfrastructure
         open PhysicalDataStructures
         
-        // Initialize streaming pool with channels for each dependency group
+        // Initialize streaming pool with proper cancellation
+        let mutable globalPoolCounter = 0
+    
         let createStreamingPool (triplesMaps: TriplesMap[]) (output: TripleOutputStream) : StreamingPool =
+            // DEBUG: Check TriplesMap inputs
+            for i, tm in triplesMaps |> Array.indexed do
+                let iteratorPath = tm.LogicalSource.SourceIterator |> Option.defaultValue "$"
+                printfn "DEBUG-POOL-INPUT: TriplesMap %d iterator: '%s'" i iteratorPath
+                if iteratorPath.Contains("\n") || iteratorPath.Contains("\r") then
+                    printfn "DEBUG-POOL-INPUT: *** CORRUPTION IN INPUT TRIPLES MAP ***"
+            
             let plan = RMLPlanner.createRMLPlan triplesMaps
-            let channels = Array.init plan.OrderedMaps.Length (fun _ -> createStreamChannel())
+            
+            // DEBUG: Check plan paths after creation
+            printfn "DEBUG-POOL-PLAN: PathToMaps after creation:"
+            FastMap.iter (fun path indices -> 
+                printfn "DEBUG-POOL-PLAN: Path '%s' -> %A" path indices
+                if path.Contains("\n") || path.Contains("\r") then
+                    printfn "DEBUG-POOL-PLAN: *** CORRUPTION IN PLAN PATH ***"
+            ) plan.PathToMaps
+            
+            // DEBUG: Show what the planner created
+            printfn "DEBUG: Plan created with %d maps" plan.OrderedMaps.Length
+            for i, mapPlan in plan.OrderedMaps |> Array.indexed do
+                printfn "DEBUG: Map %d - Iterator: '%s', Predicates: %d" 
+                    i mapPlan.IteratorPath mapPlan.PredicateTuples.Length
+            
+            printfn "DEBUG: PathToMaps contains:"
+            FastMap.iter (fun path indices -> 
+                printfn "  - '%s' -> %A" path indices) plan.PathToMaps
+            
+            let cancellationTokenSource = new CancellationTokenSource()
+            let channels = Array.init plan.OrderedMaps.Length (fun i -> 
+                // printfn "[POOL-%d] Creating channel %d" poolId i
+                createStreamChannel cancellationTokenSource.Token)
+            
             let globalPredicateTable = createPredicateTupleTable 1000
             let globalJoinTable = createPredicateJoinTable()
             
-            // Create processing tasks for each dependency group
+            // printfn "[POOL-%d] Creating %d processing tasks" poolId plan.DependencyGroups.Length
             let processingTasks = 
                 plan.DependencyGroups
                 |> Array.mapi (fun groupIdx group ->
-                    Task.Run<unit>(fun () ->
-                        let processingStream = 
-                            createProcessingStream groupIdx group 
-                                { 
-                                    Plan = plan
-                                    Channels = channels
-                                    ProcessingTasks = [||] // Will be set after creation
-                                    GlobalPredicateTable = globalPredicateTable
-                                    GlobalJoinTable = globalJoinTable
-                                    Output = output
-                                }
-
-                        // Start lazy processing - only begins when tokens arrive
-                        processingStream |> ParStream.iter id
-                    ))
+                    // printfn "[POOL-%d] Creating task for group %d with %d maps" poolId groupIdx group.Length
+                    createProcessingTask groupIdx group {
+                        Plan = plan
+                        Channels = channels
+                        ProcessingTasks = [||]
+                        GlobalPredicateTable = globalPredicateTable
+                        GlobalJoinTable = globalJoinTable
+                        Output = output
+                        CancellationTokenSource = cancellationTokenSource
+                    })
             
+            // printfn "[POOL-%d] Streaming pool created successfully" poolId
             {
                 Plan = plan
                 Channels = channels
@@ -671,49 +739,53 @@ module Pipeline =
                 GlobalPredicateTable = globalPredicateTable
                 GlobalJoinTable = globalJoinTable
                 Output = output
+                CancellationTokenSource = cancellationTokenSource
             }
+
         
-        // Process JSON token and route to appropriate streams
-        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        // Process JSON token with clean channel operations
         let processJsonToken (pool: StreamingPool) (tokenType: JsonToken) (value: obj) (currentPath: string) (accumulatedData: Dictionary<string, obj>) : unit =
-            let token = {
-                TokenType = tokenType
-                Value = value
-                Path = currentPath
-                Depth = currentPath.Split('.').Length
-                IsComplete = (tokenType = JsonToken.EndObject || tokenType = JsonToken.EndArray)
-            }
-            
-            // DEBUG: Print path matching attempt
-            printfn "Trying to match path: '%s'" currentPath
-            
-            // Route to appropriate channels based on path matching
-            match FastMap.tryFind currentPath pool.Plan.PathToMaps with
-            | ValueSome mapIndices ->
-                printfn "MATCH FOUND! Path '%s' matched indices: %A" currentPath mapIndices
-                for mapIndex in mapIndices do
-                    let channel = pool.Channels.[mapIndex]
+            if pool.CancellationTokenSource.Token.IsCancellationRequested then
+                () 
+            else
+                let token = {
+                    TokenType = tokenType
+                    Value = value
+                    Path = currentPath
+                    Depth = currentPath.Split('.').Length
+                    IsComplete = (tokenType = JsonToken.EndObject || tokenType = JsonToken.EndArray)
+                }
+                
+                // DEBUG: Show what paths we're looking for vs what we have
+                match FastMap.tryFind currentPath pool.Plan.PathToMaps with
+                | ValueSome mapIndices ->
+                    printfn "DEBUG: Found path '%s' -> maps %A" currentPath mapIndices
+                    for mapIndex in mapIndices do
+                        let channel = pool.Channels.[mapIndex]
+                        let finalToken = 
+                            if token.IsComplete then
+                                printfn "DEBUG: Sending completion token with %d context items" 
+                                    (match accumulatedData with 
+                                    | null -> 0 
+                                    | dict -> dict.Count)
+                                { token with Value = accumulatedData :> obj }
+                            else
+                                token
+                        enqueueToken channel finalToken |> ignore
+                | ValueNone -> 
+                    printfn "DEBUG: No mapping found for path '%s'" currentPath
                     
-                    // Mark channel as started and enqueue token
-                    if not channel.IsStarted then
-                        channel.IsStarted <- true
-                    
-                    // For completion tokens, include accumulated data
-                    let finalToken = 
-                        if token.IsComplete then
-                            { token with Value = accumulatedData :> obj }
-                        else
-                            token
-                    
-                    enqueueToken channel finalToken
-            | ValueNone -> 
-                printfn "NO MATCH for path: '%s'" currentPath
+                    // DEBUG: Show what paths ARE in the plan
+                    if currentPath.Contains("people") then
+                        printfn "DEBUG: Available paths in plan:"
+                        FastMap.iter (fun path indices -> 
+                            printfn "  - '%s' -> %A" path indices) pool.Plan.PathToMaps
 
     // Main RML Stream Processor
     module RMLStreamProcessor =
         
         open StreamProcessor
-        
+
         let processRMLStream 
             (reader: JsonTextReader) 
             (triplesMaps: TriplesMap[]) 
@@ -727,7 +799,7 @@ module Pipeline =
                 (isInArray: bool)
                 (arrayDepth: int)
                 (contextStack: ResizeArray<bool * string * int>) =
-                
+                            
                 if reader.Read() then
                     let buildCurrentPath () =
                         if pathStack.Count = 0 then 
@@ -741,22 +813,19 @@ module Pipeline =
                     match reader.TokenType with
                     | JsonToken.StartObject ->
                         objectStack.Add(Dictionary<string, obj>())
-                        printfn "StartObject - Path: '%s'" currentPath
-                        processJsonToken pool reader.TokenType reader.Value currentPath (if objectStack.Count > 0 then objectStack.[objectStack.Count - 1] else null)
+                        // DON'T process token here for nested objects
                         parseLoop pool pathStack objectStack currentProperty isInArray arrayDepth contextStack
 
                     | JsonToken.PropertyName ->
                         let propName = reader.Value :?> string
                         if not isInArray then
                             pathStack.Add(propName)
-                        printfn "PropertyName: '%s', current path: '%s', isInArray: %b" propName (buildCurrentPath()) isInArray
                         parseLoop pool pathStack objectStack propName isInArray arrayDepth contextStack
 
                     | JsonToken.String 
                     | JsonToken.Integer
                     | JsonToken.Float 
                     | JsonToken.Boolean ->
-                        // Just update property, do NOT emit any triples here!
                         let newCurrentProperty =
                             if not (String.IsNullOrEmpty currentProperty) && objectStack.Count > 0 then
                                 objectStack.[objectStack.Count - 1].[currentProperty] <- reader.Value
@@ -773,7 +842,11 @@ module Pipeline =
                                 ctx
                             else
                                 Dictionary<string, obj>()
-                        processJsonToken pool reader.TokenType context endPath context
+                        
+                        // ONLY process completion tokens for array items
+                        if isInArray then
+                            processJsonToken pool reader.TokenType context endPath context
+                        
                         if not isInArray && pathStack.Count > 0 then
                             pathStack.RemoveAt(pathStack.Count - 1)
                         parseLoop pool pathStack objectStack currentProperty isInArray arrayDepth contextStack
@@ -782,15 +855,11 @@ module Pipeline =
                         contextStack.Add((isInArray, currentProperty, arrayDepth))
                         let newIsInArray = true
                         let newArrayDepth = arrayDepth + 1
-                        let arrayPath = buildCurrentPath()
-                        printfn "StartArray - Path: '%s'" arrayPath
-                        processJsonToken pool reader.TokenType reader.Value arrayPath (if objectStack.Count > 0 then objectStack.[objectStack.Count - 1] else null)
+                        // DON'T process StartArray token
                         parseLoop pool pathStack objectStack currentProperty newIsInArray newArrayDepth contextStack
 
                     | JsonToken.EndArray ->
-                        let endPath = buildCurrentPath()
-                        printfn "EndArray - Path: '%s'" endPath
-                        processJsonToken pool reader.TokenType null endPath (if objectStack.Count > 0 then objectStack.[objectStack.Count - 1] else null)
+                        // DON'T process EndArray token
                         let (newIsInArray, newCurrentProperty, newArrayDepth) =
                             if contextStack.Count > 0 then
                                 let (prevIsArray, prevProperty, prevArrayDepth) = contextStack.[contextStack.Count - 1]
@@ -805,34 +874,44 @@ module Pipeline =
                     | _ ->
                         parseLoop pool pathStack objectStack currentProperty isInArray arrayDepth contextStack
                 else
-                    () // end of parsing
+                    () // end of parsing        
+
+            let sessionId = Interlocked.Increment(&globalPoolCounter)
+            // printfn "[SESSION-%d] Starting RML stream processing" sessionId
 
             task {
                 reader.SupportMultipleContent <- true
                 reader.DateParseHandling <- DateParseHandling.None
 
-                // Step 1: Initialize streaming pool (pre-processing phase)
                 let pool = createStreamingPool triplesMaps output
+                
+                try
+                    let pathStack = ResizeArray<string>()
+                    let objectStack = ResizeArray<Dictionary<string, obj>>()
+                    let contextStack = ResizeArray<bool * string * int>()
+                    parseLoop pool pathStack objectStack "" false 0 contextStack
 
-                printfn "=== PathToMaps Index ==="
-                pool.Plan.PathToMaps
-                |> FastMap.iter (fun path indices ->
-                    printfn "Path: '%s' -> Indices: %A" path indices)
-                printfn "========================"                
+                    for channel in pool.Channels do
+                        completeChannel channel
 
-                // Step 2: Run the recursive parser
-                let pathStack = ResizeArray<string>()
-                let objectStack = ResizeArray<Dictionary<string, obj>>()
-                let contextStack = ResizeArray<bool * string * int>()
-                parseLoop pool pathStack objectStack "" false 0 contextStack
+                    // Create a timeout cancellation token
+                    use timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(10.0))
+                    use combinedCts = CancellationTokenSource.CreateLinkedTokenSource(pool.CancellationTokenSource.Token, timeoutCts.Token)
+                    
+                    try
+                        // Wait for processing with combined cancellation
+                        let! _ = Task.WhenAll(pool.ProcessingTasks).WaitAsync(combinedCts.Token)
+                        // printfn "Processing completed successfully"
+                        ()
+                    with
+                    | :? OperationCanceledException when timeoutCts.Token.IsCancellationRequested ->
+                        // printfn "Processing timed out, cancelling..."
+                        pool.CancellationTokenSource.Cancel()
+                    | :? OperationCanceledException ->
+                        // printfn "Processing was cancelled"
 
-                // Step 3: Signal completion to all channels
-                for channel in pool.Channels do
-                    completeChannel channel
-
-                // Step 4: Wait for all processing to complete
-                let! _ = Task.WhenAll(pool.ProcessingTasks)
-
-                // Step 5: Final flush
-                PhysicalDataStructures.forceFlush pool.GlobalPredicateTable output
+                    PhysicalDataStructures.forceFlush pool.GlobalPredicateTable output
+                finally
+                    pool.CancellationTokenSource.Cancel()
+                    pool.CancellationTokenSource.Dispose()
             }

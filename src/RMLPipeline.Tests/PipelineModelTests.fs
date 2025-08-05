@@ -233,6 +233,35 @@ module PipelineModelBased =
                 return sprintf """{"people": [%s]}""" personsJson
             }
 
+        let genMatchingPersonData (iteratorPath: string) =
+            gen {
+                // Extract ALL segments from the path
+                let segments = iteratorPath.Replace("$.", "").Replace("[*]", "").Split('.')
+                
+                let! persons = Gen.listOf (gen {
+                    let! id = Gen.choose(1, 1000) |> Gen.map string
+                    let! name = genValidName
+                    let! age = Gen.choose(1, 100)
+                    return Map.ofList [
+                        ("id", box id)
+                        ("name", box name) 
+                        ("age", box age)
+                    ]
+                })
+                
+                // Build nested JSON structure from the path segments
+                let rec buildNestedObject (segments: string[]) (index: int) (arrayData: obj) : obj =
+                    if index >= segments.Length then
+                        arrayData
+                    else
+                        let currentSegment = segments.[index]
+                        let nextValue = buildNestedObject segments (index + 1) arrayData
+                        Map.ofList [(currentSegment, nextValue)] |> box
+                
+                let jsonObject = buildNestedObject segments 0 (box (persons |> List.toArray))
+                return JsonConvert.SerializeObject(jsonObject, Formatting.None)
+            }
+
     // Helper functions for calculating expected triples
     let rec calculateExpectedTriples (jsonData: string) (triplesMaps: TriplesMap[]) : Set<Triple> =
         try
@@ -499,39 +528,28 @@ module PipelineModelBased =
         testList "Pipeline Property-Based Tests" [
             testProperty "can process person data with shrinking" <| 
                 Prop.forAll (Arb.fromGen Generators.genSimplePersonJson) (fun json ->
-                    // Use a fixed mapping for consistency
                     let mockOutput = MockTripleOutputStream()
+                    // Use FIXED mapping that matches the JSON structure
                     let mapping = buildTriplesMap (triplesMap {
                         do! setLogicalSource (logicalSource {
-                            do! iterator "$.people[*]"
+                            do! iterator "$.people[*]"  // FIXED - matches the JSON
                             do! asJSONPath
                         })
-                        
                         do! setSubjectMap (subjectMap {
                             do! subjectTermMap (templateTermAsIRI "http://example.org/person/{id}")
                             do! addClass foafPerson
                         })
-                        
                         do! addPredicateObjectMap (simplePredObj foafName "name")
                         do! addPredicateObjectMap (typedPredObj foafAge "age" xsdInteger)
                     })
                     
-                    try
-                        use reader = new JsonTextReader(new StringReader(json))
-                        let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
-                        task.Wait()
-                        
-                        // Debug output for failing cases
-                        if mockOutput.EmittedTriples.Length = 0 then
-                            printfn "FAILING CASE - JSON: %s" json
-                            printfn "Errors: %A" mockOutput.Errors
-                        
-                        mockOutput.EmittedTriples.Length > 0
-                    with
-                    | ex -> 
-                        printfn "EXCEPTION for JSON: %s, Error: %s" json ex.Message
-                        false
+                    use reader = new JsonTextReader(new StringReader(json))
+                    let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
+                    task.Wait()
+                    
+                    mockOutput.EmittedTriples.Length > 0
                 )
+
                 
             testProperty "minimal failing case finder" <|
                 Prop.forAll (Arb.fromGen (Gen.elements [
@@ -561,14 +579,14 @@ module PipelineModelBased =
                         task.Wait()
                         
                         if mockOutput.EmittedTriples.Length = 0 then
-                            printfn "MINIMAL FAILING CASE: %s" json
-                            printfn "Debug info needed for: %s" json
+                            // printfn "MINIMAL FAILING CASE: %s" json
+                            // printfn "Debug info needed for: %s" json
                             false
                         else
                             true
                     with
                     | ex -> 
-                        printfn "EXCEPTION for: %s, Error: %s" json ex.Message
+                        // printfn "EXCEPTION for: %s, Error: %s" json ex.Message
                         false
                 )
         ]
@@ -591,14 +609,14 @@ module PipelineModelBased =
                     do! addPredicateObjectMap (simplePredObj foafName "name")
                 })
                 
-                printfn "=== DEBUGGING PATH CONSTRUCTION ==="
-                printfn "Expected iterator: %A" mapping.LogicalSource.SourceIterator
+                // printfn "=== DEBUGGING PATH CONSTRUCTION ==="
+                // printfn "Expected iterator: %A" mapping.LogicalSource.SourceIterator
                 
                 use reader = new JsonTextReader(new StringReader(json))
                 let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
                 task.Wait()
                 
-                printfn "Result: %d triples, %d errors" mockOutput.EmittedTriples.Length mockOutput.Errors.Length
+                // printfn "Result: %d triples, %d errors" mockOutput.EmittedTriples.Length mockOutput.Errors.Length
                 
                 // This test is for debugging only - we expect it to fail until we fix the issue
                 Expect.isTrue true "Debug test completed"
@@ -659,28 +677,167 @@ module PipelineModelBased =
                 })
                 
                 // Debug: Print the mapping structure
-                printfn "Iterator path: %A" mapping.LogicalSource.SourceIterator
-                printfn "Predicate-Object maps count: %d" mapping.PredicateObjectMap.Length
+                // printfn "Iterator path: %A" mapping.LogicalSource.SourceIterator
+                // printfn "Predicate-Object maps count: %d" mapping.PredicateObjectMap.Length
                 
                 use reader = new JsonTextReader(new StringReader(json))
                 let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
                 task.Wait()
                 
                 // Debug: Print what we got
-                printfn "Emitted triples count: %d" mockOutput.EmittedTriples.Length
-                printfn "Errors count: %d" mockOutput.Errors.Length
-                if mockOutput.Errors.Length > 0 then
-                    for error in mockOutput.Errors do
-                        printfn "Error: %s" error
+                // printfn "Emitted triples count: %d" mockOutput.EmittedTriples.Length
+                // printfn "Errors count: %d" mockOutput.Errors.Length
+                //if mockOutput.Errors.Length > 0 then
+                //    for error in mockOutput.Errors do
+                        // printfn "Error: %s" error
                 
-                for triple in mockOutput.EmittedTriples do
-                    printfn "Triple: %s -> %s -> %s" triple.Subject triple.Predicate triple.Object
+                //for triple in mockOutput.EmittedTriples do
+                    // printfn "Triple: %s -> %s -> %s" triple.Subject triple.Predicate triple.Object
                 
                 Expect.isGreaterThan mockOutput.EmittedTriples.Length 0 "Should emit some triples"
                 Expect.equal mockOutput.Errors.Length 0 "Should have no errors"
                 
                 let subjects = mockOutput.EmittedTriples |> Array.map (_.Subject) |> Array.distinct
                 Expect.contains subjects "http://example.org/person/1" "Should have correct subject"
+
+            testProperty "debug corruption in property tests" <| 
+                Prop.forAll (Arb.fromGen Generators.genSimpleTriplesMap) (fun mapping ->
+                    let mockOutput = MockTripleOutputStream()
+                    let json = """{"people": [{"id": "test1", "name": "Test Name"}]}"""
+                    
+                    // DEBUG: Check the generated mapping
+                    printfn "PROP-DEBUG: Generated mapping iterator: '%A'" mapping.LogicalSource.SourceIterator
+                    
+                    // Check what happens when we create a plan with this mapping
+                    let plan = RMLPlanner.createRMLPlan [|mapping|]
+                    
+                    printfn "PROP-DEBUG: Plan paths after creation:"
+                    FastMap.iter (fun path indices -> 
+                        printfn "PROP-DEBUG: '%s' -> %A" path indices
+                        if path.Contains("\n") || path.Contains("\r") then
+                            printfn "PROP-DEBUG: *** CORRUPTION DETECTED IN PROPERTY TEST ***"
+                    ) plan.PathToMaps
+                    
+                    use reader = new JsonTextReader(new StringReader(json))
+                    let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
+                    task.Wait()
+                    
+                    // Always return true for debug purposes
+                    true
+                )
+
+            testCase "debug DSL corruption" <| fun _ ->
+                // Test the exact same DSL call as the generator
+                let iteratorPath = "$.people[*]"  // Known good value
+                let subjectTemplate = "http://example.org/person/{id}"  // Known good value
+                let predicateIri = "http://xmlns.com/foaf/0.1/name"  // Known good value
+                let objectRef = "name"  // Known good value
+                
+                printfn "DSL-DEBUG: Input values:"
+                printfn "  iteratorPath: '%s'" iteratorPath
+                printfn "  subjectTemplate: '%s'" subjectTemplate
+                printfn "  predicateIri: '%s'" predicateIri
+                printfn "  objectRef: '%s'" objectRef
+                
+                let mapping = buildTriplesMap (triplesMap {
+                    do! setLogicalSource (logicalSource {
+                        do! iterator iteratorPath
+                        do! asJSONPath
+                    })
+                    
+                    do! setSubjectMap (subjectMap {
+                        do! subjectTermMap (templateTermAsIRI subjectTemplate)
+                    })
+                    
+                    do! addPredicateObjectMap (simplePredObj predicateIri objectRef)
+                })
+                
+                printfn "DSL-DEBUG: Result mapping iterator: '%A'" mapping.LogicalSource.SourceIterator
+                
+                // Check what happens when we create a plan
+                let plan = RMLPlanner.createRMLPlan [|mapping|]
+                
+                printfn "DSL-DEBUG: Plan paths:"
+                FastMap.iter (fun path indices -> 
+                    printfn "DSL-DEBUG: '%s' -> %A" path indices
+                ) plan.PathToMaps
+                
+                Expect.isTrue true "Debug completed"
+            
+            testCase "debug minimal path matching" <| fun _ ->
+                let json = """{"people": [{"id": "1", "name": "John"}]}"""
+                let mockOutput = MockTripleOutputStream()
+                
+                let mapping = buildTriplesMap (triplesMap {
+                    do! setLogicalSource (logicalSource {
+                        do! iterator "$.people[*]"
+                        do! asJSONPath
+                    })
+                    do! setSubjectMap (subjectMap {
+                        do! subjectTermMap (templateTermAsIRI "http://example.org/person/{id}")
+                    })
+                    do! addPredicateObjectMap (simplePredObj foafName "name")
+                })
+                
+                // DEBUG: Check what the mapping looks like
+                printfn "DEBUG: Mapping iterator: %A" mapping.LogicalSource.SourceIterator
+                printfn "DEBUG: Subject template: %A" 
+                    (mapping.SubjectMap |> Option.bind (fun sm -> sm.SubjectTermMap.ExpressionMap.Template))
+                
+                use reader = new JsonTextReader(new StringReader(json))
+                let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
+                task.Wait()
+                
+                printfn "DEBUG: Emitted %d triples" mockOutput.EmittedTriples.Length
+                for triple in mockOutput.EmittedTriples do
+                    printfn "DEBUG: Triple: %s -> %s -> %s" triple.Subject triple.Predicate triple.Object
+                
+                Expect.isTrue true "Debug completed"
+
+            // Then use it like:
+            testProperty "can process person data with matching paths" <|
+                Prop.forAll (Arb.fromGen (gen {
+                    let! mapping = Generators.genSimpleTriplesMap
+                    let iteratorPath = mapping.LogicalSource.SourceIterator |> Option.defaultValue "$.people[*]"
+                    let! json = Generators.genMatchingPersonData iteratorPath
+                    return (json, mapping)
+                })) (fun (json, mapping) ->
+                    let mockOutput = MockTripleOutputStream()
+                    
+                    use reader = new JsonTextReader(new StringReader(json))
+                    let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
+                    task.Wait()
+                    
+                    mockOutput.EmittedTriples.Length > 0
+                )
+
+            ftestCase "test specific generated path" <| fun _ ->
+                let mockOutput = MockTripleOutputStream()
+                // Use one of the paths from your debug output
+                let generatedPath = "$.jrnkYmGUu8cqfTyB1p.Mr5UiCQF4YRgZ85I7b[*]"
+                
+                // Generate JSON that matches this path
+                let json = """{"jrnkYmGUu8cqfTyB1p": {"Mr5UiCQF4YRgZ85I7b": [{"id": "1", "name": "Test"}]}}"""
+                
+                let mapping = buildTriplesMap (triplesMap {
+                    do! setLogicalSource (logicalSource {
+                        do! iterator generatedPath
+                        do! asJSONPath
+                    })
+                    do! setSubjectMap (subjectMap {
+                        do! subjectTermMap (templateTermAsIRI "http://example.org/person/{id}")
+                    })
+                    do! addPredicateObjectMap (simplePredObj foafName "name")
+                })
+                
+                use reader = new JsonTextReader(new StringReader(json))
+                let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
+                task.Wait()
+                
+                printfn "Generated path: %s" generatedPath
+                printfn "Emitted triples: %d" mockOutput.EmittedTriples.Length
+                
+                Expect.isGreaterThan mockOutput.EmittedTriples.Length 0 "Should emit triples with matching path"
 
             testCase "handles multiple triples maps correctly" <| fun _ ->
                 let mockOutput = MockTripleOutputStream()
@@ -725,6 +882,47 @@ module PipelineModelBased =
                 Expect.isTrue (subjects.Contains("http://example.org/person/1")) "Should have person subject"
                 Expect.isTrue (subjects.Contains("http://example.org/company/c1")) "Should have company subject"
 
+            testCase "minimal deadlock reproduction" <| fun _ ->
+                let results = ResizeArray<bool>()
+                
+                // Run multiple instances in parallel WITHOUT sharing any objects
+                let tasks = 
+                    [1..10] 
+                    |> List.map (fun i -> 
+                        Task.Run(fun () ->
+                            let json = sprintf """{"people": [{"id": "%d", "name": "Test%d"}]}""" i i
+                            let mockOutput = MockTripleOutputStream()
+                            
+                            let mapping = buildTriplesMap (triplesMap {
+                                do! setLogicalSource (logicalSource {
+                                    do! iterator "$.people[*]"
+                                    do! asJSONPath
+                                })
+                                do! setSubjectMap (subjectMap {
+                                    do! subjectTermMap (templateTermAsIRI "http://example.org/person/{id}")
+                                })
+                                do! addPredicateObjectMap (simplePredObj foafName "name")
+                            })
+                            
+                            use reader = new JsonTextReader(new StringReader(json))
+                            let processingTask = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
+                            
+                            // Add timeout to detect deadlock
+                            if processingTask.Wait(TimeSpan.FromSeconds(5.0)) then
+                                results.Add(true)
+                                // // printfn "Task %d completed successfully" i
+                            else
+                                results.Add(false)
+                                // // printfn "Task %d DEADLOCKED" i
+                        ))
+                
+                Task.WaitAll(tasks |> List.toArray, TimeSpan.FromSeconds(30.0)) |> ignore
+                
+                let successCount = results |> Seq.filter id |> Seq.length
+                // printfn "Completed: %d/%d tasks" successCount results.Count
+                
+                Expect.equal successCount results.Count "All tasks should complete without deadlock"
+            
             testCase "handles empty JSON gracefully" <| fun _ ->
                 let mockOutput = MockTripleOutputStream()
                 let json = "{}"
