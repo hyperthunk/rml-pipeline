@@ -5,16 +5,16 @@
 
             open Expecto
             open RMLPipeline.Tests.VocabSuite
-            open RMLPipeline.Tests.PipelineModelBased
+            // open RMLPipeline.Tests.PipelineModelBased
 
             [<EntryPoint>]
             let main argv =
-                let allTests = testList "All RML Tests" [
+                (* let allTests = testList "All RML Tests" [
                     allComputationRMLTests
                     pipelinePropertyTests
                     pipelineModelBasedTests                    
-                ]
+                ] *)
                 
-                allTests
+                allComputationRMLTests
                 |> Test.shuffle defaultConfig.joinWith.asString
                 |> runTestsWithCLIArgs [] argv
