@@ -8,6 +8,7 @@ module Pipeline =
     open System.Collections.Concurrent
     open System.Threading
     open System.Threading.Tasks
+    open System.Threading.Channels
     open System.Runtime.CompilerServices
     open Newtonsoft.Json
     open Nessos.Streams
@@ -41,6 +42,18 @@ module Pipeline =
         Path: string
         Depth: int
         IsComplete: bool
+    }
+
+    // Enhanced token data for improved producer-consumer pattern
+    [<Struct>]
+    type EnhancedStreamToken = {
+        TokenType: JsonToken
+        Value: obj
+        Path: string
+        Depth: int
+        IsComplete: bool
+        Timestamp: int64
+        ProcessorId: int
     }
 
     // Optimized predicate tuple structure (unchanged)
@@ -112,9 +125,29 @@ module Pipeline =
         mutable IsStarted: bool
     }
 
+    // Enhanced streaming infrastructure using .NET Channels API
+    type EnhancedStreamChannel = {
+        Channel: Channel<EnhancedStreamToken>
+        Reader: ChannelReader<EnhancedStreamToken>
+        Writer: ChannelWriter<EnhancedStreamToken>
+        mutable IsCompleted: bool
+        mutable IsStarted: bool
+        ProcessorId: int
+    }
+
     type StreamingPool = {
         Plan: RMLPlan
         Channels: StreamChannel[]
+        ProcessingTasks: Task[]
+        GlobalPredicateTable: PredicateTupleTable
+        GlobalJoinTable: PredicateJoinTable
+        Output: TripleOutputStream
+    }
+
+    // Enhanced streaming pool using .NET Channels API
+    type EnhancedStreamingPool = {
+        Plan: RMLPlan
+        Channels: EnhancedStreamChannel[]
         ProcessingTasks: Task[]
         GlobalPredicateTable: PredicateTupleTable
         GlobalJoinTable: PredicateJoinTable
@@ -596,6 +629,139 @@ module Pipeline =
             )
     open StreamInfrastructure
 
+    // Enhanced Stream Processor using .NET Channels API
+    module EnhancedStreamProcessor =
+        
+        open PhysicalDataStructures
+        
+        // Create enhanced stream channel using .NET Channels API
+        let createEnhancedStreamChannel (processorId: int) : EnhancedStreamChannel =
+            let channel = Channel.CreateUnbounded<EnhancedStreamToken>()
+            {
+                Channel = channel
+                Reader = channel.Reader
+                Writer = channel.Writer
+                IsCompleted = false
+                IsStarted = false
+                ProcessorId = processorId
+            }
+        
+        // Non-blocking token enqueue for enhanced channel
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        let enqueueEnhancedToken (channel: EnhancedStreamChannel) (token: EnhancedStreamToken) : ValueTask<bool> =
+            if not channel.IsCompleted then
+                channel.Writer.TryWrite(token) |> ValueTask.FromResult
+            else
+                ValueTask.FromResult(false)
+        
+        // Signal completion to enhanced channel
+        let completeEnhancedChannel (channel: EnhancedStreamChannel) : unit =
+            if not channel.IsCompleted then
+                channel.IsCompleted <- true
+                channel.Writer.Complete()
+        
+        // Create processing stream for enhanced channels
+        let createEnhancedProcessingStream (groupIndex: int) (group: int[]) (pool: EnhancedStreamingPool) : Task<unit> =
+            Task.Run<unit>(fun () ->
+                let mutable shouldContinue = true
+                while shouldContinue do
+                    let mutable hasData = false
+                    
+                    // Check all channels in this group for tokens
+                    for mapIndex in group do
+                        let channel = pool.Channels.[mapIndex]
+                        let mutable token = Unchecked.defaultof<EnhancedStreamToken>
+                        
+                        if channel.Reader.TryRead(&token) then
+                            hasData <- true
+                            
+                            if token.IsComplete then
+                                shouldContinue <- false
+                            else
+                                // Process the token
+                                let context = Dictionary<string, obj>()
+                                
+                                // Process predicate tuples  
+                                for tuple in pool.Plan.PredicateTuples do
+                                    if addPredicateTuple pool.GlobalPredicateTable tuple context then
+                                        flushIfNeeded pool.GlobalPredicateTable pool.Output context
+                                
+                                // Process join tuples
+                                for joinTuple in pool.Plan.JoinTuples do
+                                    processPredicateTuple joinTuple.ParentTuple pool.Output context
+                                    processPredicateTuple joinTuple.ChildTuple pool.Output context
+                    
+                    if not hasData then
+                        // Check if all channels in group are completed
+                        let allCompleted = group |> Array.forall (fun idx -> pool.Channels.[idx].IsCompleted)
+                        if allCompleted then
+                            shouldContinue <- false
+                        else
+                            // Brief wait before checking again
+                            Thread.Sleep(1)
+            )
+        
+        // Initialize enhanced streaming pool with channels for each dependency group
+        let createEnhancedStreamingPool (triplesMaps: TriplesMap[]) (output: TripleOutputStream) : EnhancedStreamingPool =
+            let plan = RMLPlanner.createRMLPlan triplesMaps
+            let channels = Array.init plan.OrderedMaps.Length (fun i -> createEnhancedStreamChannel i)
+            let globalPredicateTable = createPredicateTupleTable 1000
+            let globalJoinTable = createPredicateJoinTable()
+            
+            let processingTasks = 
+                plan.DependencyGroups
+                |> Array.mapi (fun groupIdx group ->
+                    createEnhancedProcessingStream groupIdx group 
+                        {
+                            Plan = plan
+                            Channels = channels
+                            ProcessingTasks = [||] // Will be set after creation
+                            GlobalPredicateTable = globalPredicateTable
+                            GlobalJoinTable = globalJoinTable
+                            Output = output
+                        })
+            
+            {
+                Plan = plan
+                Channels = channels
+                ProcessingTasks = processingTasks
+                GlobalPredicateTable = globalPredicateTable
+                GlobalJoinTable = globalJoinTable
+                Output = output
+            }
+        
+        // Process JSON token using enhanced channels
+        let processEnhancedJsonToken (pool: EnhancedStreamingPool) (tokenType: JsonToken) (value: obj) (currentPath: string) (accumulatedData: Dictionary<string, obj>) : unit =
+            
+            // Create enhanced token with timestamp and processor info
+            let createEnhancedToken (isComplete: bool) : EnhancedStreamToken =
+                {
+                    TokenType = tokenType
+                    Value = value
+                    Path = currentPath
+                    Depth = currentPath.Split('/').Length - 1
+                    IsComplete = isComplete
+                    Timestamp = DateTime.UtcNow.Ticks
+                    ProcessorId = Thread.CurrentThread.ManagedThreadId
+                }
+            
+            // Route to appropriate channels based on path matching
+            for mapIndex in 0 .. pool.Plan.OrderedMaps.Length - 1 do
+                let map = pool.Plan.OrderedMaps.[mapIndex]
+                if currentPath.StartsWith(map.LogicalSource.SourcePath) then
+                    let channel = pool.Channels.[mapIndex]
+                    
+                    // Mark channel as started and enqueue token
+                    if not channel.IsStarted then
+                        channel.IsStarted <- true
+                    
+                    let finalToken = createEnhancedToken false
+                    
+                    // Try to write the token (this fixes the compilation error with TryRead/TryWrite usage)
+                    let writeResult = channel.Writer.TryWrite(finalToken)
+                    if not writeResult then
+                        printfn "Warning: Could not write token to channel %d" mapIndex
+
     // Stream Processor
     module StreamProcessor =
         
@@ -613,7 +779,7 @@ module Pipeline =
             let processingTasks = 
                 plan.DependencyGroups
                 |> Array.mapi (fun groupIdx group ->
-                    Task.Run(fun () ->
+                    Task.Run<unit>(fun () ->
                         let processingStream = 
                             createProcessingStream groupIdx group 
                                 { 
@@ -828,4 +994,58 @@ module Pipeline =
                     }
                 
                 do! processRMLStream reader triplesMaps output
+                do! processRMLStream reader triplesMaps output
+            }
+
+    // Enhanced RML Stream Usage (demonstrates compilation errors)
+    module EnhancedRMLStreamUsage =
+        
+        open RMLStreamProcessor
+        // Import the EnhancedStreamProcessor module to fix compilation errors
+        open EnhancedStreamProcessor
+        
+        let runEnhancedRMLProcessing() =
+            task {
+                let json = """{"people": [{"id": "1", "name": "John Doe"}, {"id": "2", "name": "Jane Smith"}]}"""
+                use reader = new JsonTextReader(new StringReader(json))
+                
+                let triplesMaps = [| (* RML.Model.TriplesMap definitions *) |]
+                let output = 
+                    {
+                        new TripleOutputStream with
+                            member _.EmitTypedTriple(subject, predicate, objValue, datatype) =
+                                printfn "Enhanced Typed Triple: %s %s %s %A" subject predicate objValue datatype
+                            member _.EmitLangTriple(subject, predicate, objValue, lang) =
+                                printfn "Enhanced Lang Triple: %s %s %s @%s" subject predicate objValue lang
+                            member _.EmitTriple(subject, predicate, objValue) =
+                                printfn "Enhanced Triple: %s %s %s" subject predicate objValue
+                    }
+                
+                // This demonstrates compilation errors from the problem statement:
+                
+                // Create enhanced streaming pool (fixes line 1011 - missing function reference)
+                let pool = createEnhancedStreamingPool triplesMaps output
+                
+                // Use the pool to process some sample data
+                processEnhancedJsonToken pool JsonToken.StartObject null "/people" (Dictionary<string, obj>())
+                
+                // Demonstrate Channel Reader TryRead error (line 734-735 from problem statement) 
+                let testChannelUsage () =
+                    let channel = createEnhancedStreamChannel 1
+                    let mutable token = Unchecked.defaultof<EnhancedStreamToken>
+                    
+                    // This would show the error: "Type constraint mismatch with 'bool * EnhancedStreamToken' vs 'bool'"
+                    let success = channel.Reader.TryRead(&token)  // Correct usage: returns bool, takes out parameter
+                    
+                    // This would show the error: "ChannelReader doesn't have 'Current' property"
+                    // let currentToken = channel.Reader.Current  // WRONG - ChannelReader doesn't have Current property
+                    
+                    if success then
+                        printfn "Read token: %A" token
+                    
+                    // Complete the channel (line 1011 from problem statement)
+                    completeEnhancedChannel channel
+                
+                testChannelUsage()
+            }
             }
