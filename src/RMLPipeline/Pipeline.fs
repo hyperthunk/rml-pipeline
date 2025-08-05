@@ -702,81 +702,71 @@ module Pipeline =
                 let pathStack = ResizeArray<string>()
                 let accumulatedData = Dictionary<string, obj>()
                 let mutable currentProperty = ""
-                let mutable isInArrayContext = false
-                let arrayContextStack = ResizeArray<bool>()
+                let mutable isInArray = false
+                let contextStack = ResizeArray<bool * string>() // (isArray, propertyName)
                 
                 // Helper function to build proper JSONPath syntax
-                let buildJsonPath (pathStack: ResizeArray<string>) (tokenType: JsonToken) =
-                    let basePath = 
-                        if pathStack.Count = 0 then 
-                            "$" 
-                        else 
-                            "$." + String.Join(".", pathStack)
-                    
-                    let finalPath = 
-                        match tokenType with
-                        | JsonToken.StartArray -> 
-                            basePath
-                        | JsonToken.EndArray ->
-                            basePath + "[*]"
-                        | JsonToken.EndObject when isInArrayContext ->
-                            basePath + "[*]"
-                        | _ -> basePath
-                    
-                    // DEBUG: Print the constructed path
-                    printfn "Constructed JSONPath: '%s' for token: %A" finalPath tokenType
-                    finalPath
+                let buildCurrentPath () =
+                    if pathStack.Count = 0 then 
+                        "$"
+                    else
+                        let basePath = "$." + String.Join(".", pathStack)
+                        if isInArray then basePath + "[*]" else basePath
                 
                 try
                     // Step 3: Stream JSON tokens to parallel processors
                     while reader.Read() do
+                        let currentPath = buildCurrentPath()
+                        
                         match reader.TokenType with
                         | JsonToken.StartObject ->
-                            arrayContextStack.Add(isInArrayContext)
-                            let jsonPath = buildJsonPath pathStack reader.TokenType
-                            processJsonToken pool reader.TokenType reader.Value jsonPath accumulatedData
+                            printfn "StartObject - Path: '%s'" currentPath
+                            processJsonToken pool reader.TokenType reader.Value currentPath accumulatedData
                             
                         | JsonToken.StartArray ->
-                            arrayContextStack.Add(isInArrayContext)
-                            isInArrayContext <- true
-                            let jsonPath = buildJsonPath pathStack reader.TokenType
-                            processJsonToken pool reader.TokenType reader.Value jsonPath accumulatedData
+                            contextStack.Add((isInArray, currentProperty))
+                            isInArray <- true
+                            let arrayPath = buildCurrentPath()
+                            printfn "StartArray - Path: '%s'" arrayPath
+                            processJsonToken pool reader.TokenType reader.Value arrayPath accumulatedData
                             
                         | JsonToken.PropertyName ->
                             let propName = reader.Value :?> string
                             pathStack.Add(propName)
                             currentProperty <- propName
-                            printfn "Added property to path stack: '%s', current stack: [%s]" propName (String.Join("; ", pathStack))
+                            printfn "PropertyName: '%s', current path: '%s'" propName (buildCurrentPath())
                             
                         | JsonToken.EndObject ->
-                            let jsonPath = buildJsonPath pathStack reader.TokenType
+                            let endPath = buildCurrentPath()
+                            printfn "EndObject - Path: '%s'" endPath
                             
                             // Send completion token with accumulated data
                             let dataClone = Dictionary<string, obj>(accumulatedData)
-                            processJsonToken pool reader.TokenType dataClone jsonPath dataClone
+                            processJsonToken pool reader.TokenType dataClone endPath dataClone
                             
-                            // Clean up path and restore array context
+                            // Clean up path stack
                             if pathStack.Count > 0 then
                                 pathStack.RemoveAt(pathStack.Count - 1)
-                            if arrayContextStack.Count > 0 then
-                                isInArrayContext <- arrayContextStack.[arrayContextStack.Count - 1]
-                                arrayContextStack.RemoveAt(arrayContextStack.Count - 1)
                             
                         | JsonToken.EndArray ->
-                            let jsonPath = buildJsonPath pathStack reader.TokenType
+                            let endPath = buildCurrentPath()
+                            printfn "EndArray - Path: '%s'" endPath
                             
                             // Send completion token with accumulated data
                             let dataClone = Dictionary<string, obj>(accumulatedData)
-                            processJsonToken pool reader.TokenType reader.Value jsonPath dataClone
+                            processJsonToken pool reader.TokenType dataClone endPath dataClone
                             
-                            // Clean up path and restore array context
+                            // Restore previous context
+                            if contextStack.Count > 0 then
+                                let (prevIsArray, prevProperty) = contextStack.[contextStack.Count - 1]
+                                contextStack.RemoveAt(contextStack.Count - 1)
+                                isInArray <- prevIsArray
+                                currentProperty <- prevProperty
+                            else
+                                isInArray <- false
+                            
                             if pathStack.Count > 0 then
                                 pathStack.RemoveAt(pathStack.Count - 1)
-                            if arrayContextStack.Count > 0 then
-                                isInArrayContext <- arrayContextStack.[arrayContextStack.Count - 1]
-                                arrayContextStack.RemoveAt(arrayContextStack.Count - 1)
-                            else
-                                isInArrayContext <- false
                             
                             accumulatedData.Clear()
                             
@@ -785,8 +775,8 @@ module Pipeline =
                                 accumulatedData.[currentProperty] <- reader.Value
                                 currentProperty <- ""
                             
-                            let jsonPath = buildJsonPath pathStack reader.TokenType
-                            processJsonToken pool reader.TokenType reader.Value jsonPath accumulatedData
+                            printfn "Value token - Path: '%s', Value: %A" currentPath reader.Value
+                            processJsonToken pool reader.TokenType reader.Value currentPath accumulatedData
                             
                         | _ -> ()
                     
