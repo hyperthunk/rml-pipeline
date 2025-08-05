@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="RMLVocabTests.fs" />
+    <Compile Include="TemplateTests.fs" />
     <Compile Include="Main.fs" />
   </ItemGroup>
   <ItemGroup>

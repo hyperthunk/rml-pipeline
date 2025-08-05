@@ -68,7 +68,7 @@ module Core =
     and ContextMetadata = {
         Path: string
         Depth: int
-        Timestamp: int64
+        // Timestamp: int64
         SourceToken: JsonToken option
     }
     
@@ -78,7 +78,7 @@ module Core =
             Metadata = {
                 Path = ""
                 Depth = 0
-                Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                // Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                 SourceToken = None
             }
         }
@@ -88,7 +88,7 @@ module Core =
             Metadata = {
                 Path = path
                 Depth = path.Split('.').Length
-                Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                // Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
                 SourceToken = None
             }
         }

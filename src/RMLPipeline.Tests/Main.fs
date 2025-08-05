@@ -5,6 +5,7 @@
 
             open Expecto
             open RMLPipeline.Tests.VocabSuite
+            open RMLPipeline.Tests.TemplateTests
             // open RMLPipeline.Tests.PipelineModelBased
 
             [<EntryPoint>]
@@ -14,6 +15,12 @@
                     pipelinePropertyTests
                     pipelineModelBasedTests                    
                 ] *)
+
+                let allTests = 
+                    testList "All RML Tests" [
+                        allComputationRMLTests
+                        allTemplateTests
+                    ]
                 
                 allComputationRMLTests
                 |> Test.shuffle defaultConfig.joinWith.asString
