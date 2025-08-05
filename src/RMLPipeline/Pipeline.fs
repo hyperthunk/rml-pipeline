@@ -703,9 +703,10 @@ module Pipeline =
                 let accumulatedData = Dictionary<string, obj>()
                 let mutable currentProperty = ""
                 let mutable isInArray = false
-                let contextStack = ResizeArray<bool * string>() // (isArray, propertyName)
+                let mutable arrayDepth = 0  // Track how deep we are in arrays
+                let contextStack = ResizeArray<bool * string * int>() // (isArray, propertyName, arrayDepth)
                 
-                // Helper function to build proper JSONPath syntax
+                // Helper function to build proper JSONPath syntax for routing
                 let buildCurrentPath () =
                     if pathStack.Count = 0 then 
                         "$"
@@ -724,17 +725,23 @@ module Pipeline =
                             processJsonToken pool reader.TokenType reader.Value currentPath accumulatedData
                             
                         | JsonToken.StartArray ->
-                            contextStack.Add((isInArray, currentProperty))
+                            contextStack.Add((isInArray, currentProperty, arrayDepth))
                             isInArray <- true
+                            arrayDepth <- arrayDepth + 1
                             let arrayPath = buildCurrentPath()
                             printfn "StartArray - Path: '%s'" arrayPath
                             processJsonToken pool reader.TokenType reader.Value arrayPath accumulatedData
                             
                         | JsonToken.PropertyName ->
                             let propName = reader.Value :?> string
-                            pathStack.Add(propName)
                             currentProperty <- propName
-                            printfn "PropertyName: '%s', current path: '%s'" propName (buildCurrentPath())
+                            
+                            // Only add to pathStack if we're not inside an array item
+                            // Properties inside array items should not affect the routing path
+                            if not isInArray then
+                                pathStack.Add(propName)
+                            
+                            printfn "PropertyName: '%s', current path: '%s', isInArray: %b" propName (buildCurrentPath()) isInArray
                             
                         | JsonToken.EndObject ->
                             let endPath = buildCurrentPath()
@@ -744,8 +751,9 @@ module Pipeline =
                             let dataClone = Dictionary<string, obj>(accumulatedData)
                             processJsonToken pool reader.TokenType dataClone endPath dataClone
                             
-                            // Clean up path stack
-                            if pathStack.Count > 0 then
+                            // Clean up path stack only if we're not inside an array
+                            // (properties inside arrays don't add to pathStack)
+                            if not isInArray && pathStack.Count > 0 then
                                 pathStack.RemoveAt(pathStack.Count - 1)
                             
                         | JsonToken.EndArray ->
@@ -758,13 +766,16 @@ module Pipeline =
                             
                             // Restore previous context
                             if contextStack.Count > 0 then
-                                let (prevIsArray, prevProperty) = contextStack.[contextStack.Count - 1]
+                                let (prevIsArray, prevProperty, prevArrayDepth) = contextStack.[contextStack.Count - 1]
                                 contextStack.RemoveAt(contextStack.Count - 1)
                                 isInArray <- prevIsArray
                                 currentProperty <- prevProperty
+                                arrayDepth <- prevArrayDepth
                             else
                                 isInArray <- false
+                                arrayDepth <- 0
                             
+                            // Remove the array property from pathStack (e.g., "people")
                             if pathStack.Count > 0 then
                                 pathStack.RemoveAt(pathStack.Count - 1)
                             
