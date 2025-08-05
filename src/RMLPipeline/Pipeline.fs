@@ -649,9 +649,13 @@ module Pipeline =
                 IsComplete = (tokenType = JsonToken.EndObject || tokenType = JsonToken.EndArray)
             }
             
+            // DEBUG: Print path matching attempt
+            printfn "Trying to match path: '%s'" currentPath
+            
             // Route to appropriate channels based on path matching
             match FastMap.tryFind currentPath pool.Plan.PathToMaps with
             | ValueSome mapIndices ->
+                printfn "MATCH FOUND! Path '%s' matched indices: %A" currentPath mapIndices
                 for mapIndex in mapIndices do
                     let channel = pool.Channels.[mapIndex]
                     
@@ -667,7 +671,8 @@ module Pipeline =
                             token
                     
                     enqueueToken channel finalToken
-            | ValueNone -> ()
+            | ValueNone -> 
+                printfn "NO MATCH for path: '%s'" currentPath
 
     // Main RML Stream Processor
     module RMLStreamProcessor =
@@ -686,6 +691,13 @@ module Pipeline =
                 // Step 1: Initialize streaming pool (pre-processing phase)
                 let pool = createStreamingPool triplesMaps output
                 
+                // DEBUG: Print what paths are in the PathToMaps index
+                printfn "=== PathToMaps Index ==="
+                pool.Plan.PathToMaps
+                |> FastMap.iter (fun path indices ->
+                    printfn "Path: '%s' -> Indices: %A" path indices)
+                printfn "========================"
+                
                 // Step 2: Track JSON parsing state
                 let pathStack = ResizeArray<string>()
                 let accumulatedData = Dictionary<string, obj>()
@@ -701,14 +713,19 @@ module Pipeline =
                         else 
                             "$." + String.Join(".", pathStack)
                     
-                    match tokenType with
-                    | JsonToken.StartArray -> 
-                        basePath
-                    | JsonToken.EndArray ->
-                        basePath + "[*]"
-                    | JsonToken.EndObject when isInArrayContext ->
-                        basePath + "[*]"
-                    | _ -> basePath
+                    let finalPath = 
+                        match tokenType with
+                        | JsonToken.StartArray -> 
+                            basePath
+                        | JsonToken.EndArray ->
+                            basePath + "[*]"
+                        | JsonToken.EndObject when isInArrayContext ->
+                            basePath + "[*]"
+                        | _ -> basePath
+                    
+                    // DEBUG: Print the constructed path
+                    printfn "Constructed JSONPath: '%s' for token: %A" finalPath tokenType
+                    finalPath
                 
                 try
                     // Step 3: Stream JSON tokens to parallel processors
@@ -729,6 +746,7 @@ module Pipeline =
                             let propName = reader.Value :?> string
                             pathStack.Add(propName)
                             currentProperty <- propName
+                            printfn "Added property to path stack: '%s', current stack: [%s]" propName (String.Join("; ", pathStack))
                             
                         | JsonToken.EndObject ->
                             let jsonPath = buildJsonPath pathStack reader.TokenType
@@ -749,7 +767,7 @@ module Pipeline =
                             
                             // Send completion token with accumulated data
                             let dataClone = Dictionary<string, obj>(accumulatedData)
-                            processJsonToken pool reader.TokenType dataClone jsonPath dataClone
+                            processJsonToken pool reader.TokenType reader.Value jsonPath dataClone
                             
                             // Clean up path and restore array context
                             if pathStack.Count > 0 then

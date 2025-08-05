@@ -478,7 +478,7 @@ module PipelineModelBased =
     let pipelineModelBasedTests =
         testList "Pipeline Model-Based Tests" [
             
-            testCase "can process real-world person data" <| fun _ ->
+            (* testCase "can process real-world person data" <| fun _ ->
                 let mockOutput = MockTripleOutputStream()
                 let json = """{"people": [{"id": "1", "name": "John Doe", "age": 30}]}"""
                 
@@ -500,6 +500,49 @@ module PipelineModelBased =
                 use reader = new JsonTextReader(new StringReader(json))
                 let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
                 task.Wait()
+                
+                Expect.isGreaterThan mockOutput.EmittedTriples.Length 0 "Should emit some triples"
+                Expect.equal mockOutput.Errors.Length 0 "Should have no errors"
+                
+                let subjects = mockOutput.EmittedTriples |> Array.map (_.Subject) |> Array.distinct
+                Expect.contains subjects "http://example.org/person/1" "Should have correct subject" *)
+
+            testCase "can process real-world person data" <| fun _ ->
+                let mockOutput = MockTripleOutputStream()
+                let json = """{"people": [{"id": "1", "name": "John Doe", "age": 30}]}"""
+                
+                let mapping = buildTriplesMap (triplesMap {
+                    do! setLogicalSource (logicalSource {
+                        do! iterator "$.people[*]"
+                        do! asJSONPath
+                    })
+                    
+                    do! setSubjectMap (subjectMap {
+                        do! subjectTermMap (templateTermAsIRI "http://example.org/person/{id}")
+                        do! addClass foafPerson
+                    })
+                    
+                    do! addPredicateObjectMap (simplePredObj foafName "name")
+                    do! addPredicateObjectMap (typedPredObj foafAge "age" xsdInteger)
+                })
+                
+                // Debug: Print the mapping structure
+                printfn "Iterator path: %A" mapping.LogicalSource.SourceIterator
+                printfn "Predicate-Object maps count: %d" mapping.PredicateObjectMap.Length
+                
+                use reader = new JsonTextReader(new StringReader(json))
+                let task = RMLStreamProcessor.processRMLStream reader [|mapping|] mockOutput
+                task.Wait()
+                
+                // Debug: Print what we got
+                printfn "Emitted triples count: %d" mockOutput.EmittedTriples.Length
+                printfn "Errors count: %d" mockOutput.Errors.Length
+                if mockOutput.Errors.Length > 0 then
+                    for error in mockOutput.Errors do
+                        printfn "Error: %s" error
+                
+                for triple in mockOutput.EmittedTriples do
+                    printfn "Triple: %s -> %s -> %s" triple.Subject triple.Predicate triple.Object
                 
                 Expect.isGreaterThan mockOutput.EmittedTriples.Length 0 "Should emit some triples"
                 Expect.equal mockOutput.Errors.Length 0 "Should have no errors"
