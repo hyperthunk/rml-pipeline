@@ -104,8 +104,7 @@ module Pipeline =
 
     // Physical data structures
     type PredicateTupleTable = {
-        Tuples: ConcurrentDictionary<uint64, PredicateTuple>
-        DuplicateCheck: ConcurrentDictionary<string, bool>
+        Tuples: ConcurrentDictionary<string, Dictionary<string, obj> * PredicateTuple>
         FlushThreshold: int
         mutable CurrentSize: int
     }
@@ -138,7 +137,7 @@ module Pipeline =
     type StreamingPool = {
         Plan: RMLPlan
         Channels: StreamChannel[]
-        ProcessingTasks: Task[]
+        ProcessingTasks: Task<unit>[]
         GlobalPredicateTable: PredicateTupleTable
         GlobalJoinTable: PredicateJoinTable
         Output: TripleOutputStream
@@ -148,7 +147,7 @@ module Pipeline =
     type EnhancedStreamingPool = {
         Plan: RMLPlan
         Channels: EnhancedStreamChannel[]
-        ProcessingTasks: Task[]
+        ProcessingTasks: Task<unit>[]
         GlobalPredicateTable: PredicateTupleTable
         GlobalJoinTable: PredicateJoinTable
         Output: TripleOutputStream
@@ -480,8 +479,7 @@ module Pipeline =
         
         let createPredicateTupleTable (flushThreshold: int) : PredicateTupleTable =
             {
-                Tuples = ConcurrentDictionary<uint64, PredicateTuple>()
-                DuplicateCheck = ConcurrentDictionary<string, bool>()
+                Tuples = ConcurrentDictionary<string, Dictionary<string, obj> * PredicateTuple>()
                 FlushThreshold = flushThreshold
                 CurrentSize = 0
             }
@@ -494,44 +492,7 @@ module Pipeline =
                 CurrentSize = 0
             }
         
-        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-        let addPredicateTuple (table: PredicateTupleTable) (tuple: PredicateTuple) (data: Dictionary<string, obj>) : bool =
-            let key = sprintf "%s|%s|%s" tuple.SubjectTemplate tuple.PredicateValue tuple.ObjectTemplate
-            
-            if table.DuplicateCheck.ContainsKey(key) then
-                false
-            else
-                table.DuplicateCheck.TryAdd(key, true) |> ignore
-                table.Tuples.TryAdd(tuple.Hash, tuple) |> ignore
-                Interlocked.Increment(&table.CurrentSize) |> ignore
-                true
-        
-        let rec flushIfNeeded (table: PredicateTupleTable) (output: TripleOutputStream) (context: Dictionary<string, obj>) : unit =
-            if table.CurrentSize >= table.FlushThreshold then
-                for kvp in table.Tuples do
-                    let tuple = kvp.Value
-                    processPredicateTuple tuple output context
-                
-                table.Tuples.Clear()
-                table.DuplicateCheck.Clear()
-                table.CurrentSize <- 0
-        
-        and processPredicateTuple (tuple: PredicateTuple) (output: TripleOutputStream) (context: Dictionary<string, obj>) : unit =
-            try
-                let subject = expandTemplate tuple.SubjectTemplate context
-                let predicate = if tuple.IsConstant then tuple.PredicateValue else expandTemplate tuple.PredicateValue context
-                let objValue = if tuple.IsConstant then tuple.ObjectTemplate else expandTemplate tuple.ObjectTemplate context
-                
-                match tuple.ObjectDatatype with
-                | Some datatype -> output.EmitTypedTriple(subject, predicate, objValue, Some datatype)
-                | None ->
-                    match tuple.ObjectLanguage with
-                    | Some lang -> output.EmitLangTriple(subject, predicate, objValue, lang)
-                    | None -> output.EmitTriple(subject, predicate, objValue)
-            with
-            | _ -> ()
-        
-        and expandTemplate (template: string) (context: Dictionary<string, obj>) : string =
+        let expandTemplate (template: string) (context: Dictionary<string, obj>) : string =
             if not (template.Contains("{")) then
                 template
             else
@@ -541,6 +502,47 @@ module Pipeline =
                     if result.Contains(placeholder) then
                         result <- result.Replace(placeholder, kvp.Value.ToString())
                 result
+
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        let addPredicateTuple (table: PredicateTupleTable) (tuple: PredicateTuple) (context: Dictionary<string, obj>) : bool =
+            let subject = expandTemplate tuple.SubjectTemplate context
+            let predicate = if tuple.IsConstant then tuple.PredicateValue else expandTemplate tuple.PredicateValue context
+            let objValue = if tuple.IsConstant then tuple.ObjectTemplate else expandTemplate tuple.ObjectTemplate context
+            let key = sprintf "%s|%s|%s" subject predicate objValue
+
+            // Store a COPY of the context to avoid mutation
+            let contextCopy = Dictionary<string, obj>(context)
+            let added = table.Tuples.TryAdd(key, (contextCopy, tuple))
+            if added then
+                Interlocked.Increment(&table.CurrentSize) |> ignore
+            added
+        
+        let rec processPredicateTuple (tuple: PredicateTuple) (output: TripleOutputStream) (context: Dictionary<string, obj>) : unit =
+            try
+                printfn "EMIT DEBUG: PredicateTuple=%A, Context=%A" tuple context
+                let subject = expandTemplate tuple.SubjectTemplate context
+                let predicate = if tuple.IsConstant then tuple.PredicateValue else expandTemplate tuple.PredicateValue context
+                let objValue = if tuple.IsConstant then tuple.ObjectTemplate else expandTemplate tuple.ObjectTemplate context
+                printfn "EMIT DEBUG: subject=%s, predicate=%s, objValue=%s" subject predicate objValue
+                match tuple.ObjectDatatype with
+                | Some datatype -> output.EmitTypedTriple(subject, predicate, objValue, Some datatype)
+                | None ->
+                    match tuple.ObjectLanguage with
+                    | Some lang -> output.EmitLangTriple(subject, predicate, objValue, lang)
+                    | None -> output.EmitTriple(subject, predicate, objValue)
+            with
+            | ex -> printfn "EXCEPTION in processPredicateTuple: %A" ex
+
+        let forceFlush (table: PredicateTupleTable) (output: TripleOutputStream) : unit =
+            printfn "FORCE FLUSH: Processing %d tuples" table.CurrentSize
+            for KeyValue(_, (context, tuple)) in table.Tuples do
+                processPredicateTuple tuple output context
+            table.Tuples.Clear()
+            table.CurrentSize <- 0
+        
+        let flushIfNeeded (table: PredicateTupleTable) (output: TripleOutputStream) : unit =
+            if table.CurrentSize >= table.FlushThreshold then
+                forceFlush table output   
 
     // Streaming Infrastructure
     module StreamInfrastructure =
@@ -620,7 +622,7 @@ module Pipeline =
                     // Process predicate tuples
                     for tuple in plan.PredicateTuples do
                         if addPredicateTuple pool.GlobalPredicateTable tuple context then
-                            flushIfNeeded pool.GlobalPredicateTable pool.Output context
+                            flushIfNeeded pool.GlobalPredicateTable pool.Output
                     
                     // Process join tuples
                     for joinTuple in plan.JoinTuples do
@@ -685,7 +687,7 @@ module Pipeline =
                                 for mapPlan in pool.Plan.OrderedMaps do
                                     for tuple in mapPlan.PredicateTuples do
                                         if addPredicateTuple pool.GlobalPredicateTable tuple context then
-                                            flushIfNeeded pool.GlobalPredicateTable pool.Output context
+                                            flushIfNeeded pool.GlobalPredicateTable pool.Output
                                     
                                     // Process join tuples for this map
                                     for joinTuple in mapPlan.JoinTuples do
@@ -699,7 +701,7 @@ module Pipeline =
                             shouldContinue <- false
                         else
                             // Brief pause to yield CPU before checking again
-                            SpinWait.SpinUntil(fun () -> false, 1)
+                            SpinWait.SpinUntil(fun () -> true) |> ignore
             )
         
         // Initialize enhanced streaming pool with channels for each dependency group
@@ -749,7 +751,7 @@ module Pipeline =
             // Route to appropriate channels based on path matching
             for mapIndex in 0 .. pool.Plan.OrderedMaps.Length - 1 do
                 let map = pool.Plan.OrderedMaps.[mapIndex]
-                if currentPath.StartsWith(map.LogicalSource.Path |> Option.defaultValue "") then
+                if currentPath.StartsWith map.IteratorPath then
                     let channel = pool.Channels.[mapIndex]
                     
                     // Mark channel as started and enqueue token
@@ -847,129 +849,126 @@ module Pipeline =
         open StreamProcessor
         
         let processRMLStream 
-                (reader: JsonTextReader) 
-                (triplesMaps: TriplesMap[]) 
-                (output: TripleOutputStream) : Task<unit> =
+            (reader: JsonTextReader) 
+            (triplesMaps: TriplesMap[]) 
+            (output: TripleOutputStream) : Task<unit> =
             
+            let rec parseLoop 
+                (pool: StreamingPool)
+                (pathStack: ResizeArray<string>)
+                (objectStack: ResizeArray<Dictionary<string, obj>>)
+                (currentProperty: string)
+                (isInArray: bool)
+                (arrayDepth: int)
+                (contextStack: ResizeArray<bool * string * int>) =
+                
+                if reader.Read() then
+                    let buildCurrentPath () =
+                        if pathStack.Count = 0 then 
+                            "$"
+                        else
+                            let basePath = "$." + String.Join(".", pathStack)
+                            if isInArray then basePath + "[*]" else basePath
+
+                    let currentPath = buildCurrentPath()
+
+                    match reader.TokenType with
+                    | JsonToken.StartObject ->
+                        objectStack.Add(Dictionary<string, obj>())
+                        printfn "StartObject - Path: '%s'" currentPath
+                        processJsonToken pool reader.TokenType reader.Value currentPath (if objectStack.Count > 0 then objectStack.[objectStack.Count - 1] else null)
+                        parseLoop pool pathStack objectStack currentProperty isInArray arrayDepth contextStack
+
+                    | JsonToken.PropertyName ->
+                        let propName = reader.Value :?> string
+                        if not isInArray then
+                            pathStack.Add(propName)
+                        printfn "PropertyName: '%s', current path: '%s', isInArray: %b" propName (buildCurrentPath()) isInArray
+                        parseLoop pool pathStack objectStack propName isInArray arrayDepth contextStack
+
+                    | JsonToken.String 
+                    | JsonToken.Integer
+                    | JsonToken.Float 
+                    | JsonToken.Boolean ->
+                        // Just update property, do NOT emit any triples here!
+                        let newCurrentProperty =
+                            if not (String.IsNullOrEmpty currentProperty) && objectStack.Count > 0 then
+                                objectStack.[objectStack.Count - 1].[currentProperty] <- reader.Value
+                                ""
+                            else currentProperty
+                        parseLoop pool pathStack objectStack newCurrentProperty isInArray arrayDepth contextStack
+
+                    | JsonToken.EndObject ->
+                        let endPath = buildCurrentPath()
+                        let context =
+                            if objectStack.Count > 0 then
+                                let ctx = objectStack.[objectStack.Count - 1]
+                                objectStack.RemoveAt(objectStack.Count - 1)
+                                ctx
+                            else
+                                Dictionary<string, obj>()
+                        processJsonToken pool reader.TokenType context endPath context
+                        if not isInArray && pathStack.Count > 0 then
+                            pathStack.RemoveAt(pathStack.Count - 1)
+                        parseLoop pool pathStack objectStack currentProperty isInArray arrayDepth contextStack
+
+                    | JsonToken.StartArray ->
+                        contextStack.Add((isInArray, currentProperty, arrayDepth))
+                        let newIsInArray = true
+                        let newArrayDepth = arrayDepth + 1
+                        let arrayPath = buildCurrentPath()
+                        printfn "StartArray - Path: '%s'" arrayPath
+                        processJsonToken pool reader.TokenType reader.Value arrayPath (if objectStack.Count > 0 then objectStack.[objectStack.Count - 1] else null)
+                        parseLoop pool pathStack objectStack currentProperty newIsInArray newArrayDepth contextStack
+
+                    | JsonToken.EndArray ->
+                        let endPath = buildCurrentPath()
+                        printfn "EndArray - Path: '%s'" endPath
+                        processJsonToken pool reader.TokenType null endPath (if objectStack.Count > 0 then objectStack.[objectStack.Count - 1] else null)
+                        let (newIsInArray, newCurrentProperty, newArrayDepth) =
+                            if contextStack.Count > 0 then
+                                let (prevIsArray, prevProperty, prevArrayDepth) = contextStack.[contextStack.Count - 1]
+                                contextStack.RemoveAt(contextStack.Count - 1)
+                                (prevIsArray, prevProperty, prevArrayDepth)
+                            else
+                                (false, "", 0)
+                        if pathStack.Count > 0 then
+                            pathStack.RemoveAt(pathStack.Count - 1)
+                        parseLoop pool pathStack objectStack newCurrentProperty newIsInArray newArrayDepth contextStack
+
+                    | _ ->
+                        parseLoop pool pathStack objectStack currentProperty isInArray arrayDepth contextStack
+                else
+                    () // end of parsing
+
             task {
                 reader.SupportMultipleContent <- true
                 reader.DateParseHandling <- DateParseHandling.None
-                
+
                 // Step 1: Initialize streaming pool (pre-processing phase)
                 let pool = createStreamingPool triplesMaps output
-                
-                // DEBUG: Print what paths are in the PathToMaps index
+
                 printfn "=== PathToMaps Index ==="
                 pool.Plan.PathToMaps
                 |> FastMap.iter (fun path indices ->
                     printfn "Path: '%s' -> Indices: %A" path indices)
-                printfn "========================"
-                
-                // Step 2: Track JSON parsing state
+                printfn "========================"                
+
+                // Step 2: Run the recursive parser
                 let pathStack = ResizeArray<string>()
-                let accumulatedData = Dictionary<string, obj>()
-                let mutable currentProperty = ""
-                let mutable isInArray = false
-                let mutable arrayDepth = 0  // Track how deep we are in arrays
-                let contextStack = ResizeArray<bool * string * int>() // (isArray, propertyName, arrayDepth)
-                
-                // Helper function to build proper JSONPath syntax for routing
-                let buildCurrentPath () =
-                    if pathStack.Count = 0 then 
-                        "$"
-                    else
-                        let basePath = "$." + String.Join(".", pathStack)
-                        if isInArray then basePath + "[*]" else basePath
-                
-                try
-                    // Step 3: Stream JSON tokens to parallel processors
-                    while reader.Read() do
-                        let currentPath = buildCurrentPath()
-                        
-                        match reader.TokenType with
-                        | JsonToken.StartObject ->
-                            printfn "StartObject - Path: '%s'" currentPath
-                            processJsonToken pool reader.TokenType reader.Value currentPath accumulatedData
-                            
-                        | JsonToken.StartArray ->
-                            contextStack.Add((isInArray, currentProperty, arrayDepth))
-                            isInArray <- true
-                            arrayDepth <- arrayDepth + 1
-                            let arrayPath = buildCurrentPath()
-                            printfn "StartArray - Path: '%s'" arrayPath
-                            processJsonToken pool reader.TokenType reader.Value arrayPath accumulatedData
-                            
-                        | JsonToken.PropertyName ->
-                            let propName = reader.Value :?> string
-                            currentProperty <- propName
-                            
-                            // Only add to pathStack if we're not inside an array item
-                            // Properties inside array items should not affect the routing path
-                            if not isInArray then
-                                pathStack.Add(propName)
-                            
-                            printfn "PropertyName: '%s', current path: '%s', isInArray: %b" propName (buildCurrentPath()) isInArray
-                            
-                        | JsonToken.EndObject ->
-                            let endPath = buildCurrentPath()
-                            printfn "EndObject - Path: '%s'" endPath
-                            
-                            // Send completion token with accumulated data
-                            let dataClone = Dictionary<string, obj>(accumulatedData)
-                            processJsonToken pool reader.TokenType dataClone endPath dataClone
-                            
-                            // Clean up path stack only if we're not inside an array
-                            // (properties inside arrays don't add to pathStack)
-                            if not isInArray && pathStack.Count > 0 then
-                                pathStack.RemoveAt(pathStack.Count - 1)
-                            
-                        | JsonToken.EndArray ->
-                            let endPath = buildCurrentPath()
-                            printfn "EndArray - Path: '%s'" endPath
-                            
-                            // Send completion token with accumulated data
-                            let dataClone = Dictionary<string, obj>(accumulatedData)
-                            processJsonToken pool reader.TokenType dataClone endPath dataClone
-                            
-                            // Restore previous context
-                            if contextStack.Count > 0 then
-                                let (prevIsArray, prevProperty, prevArrayDepth) = contextStack.[contextStack.Count - 1]
-                                contextStack.RemoveAt(contextStack.Count - 1)
-                                isInArray <- prevIsArray
-                                currentProperty <- prevProperty
-                                arrayDepth <- prevArrayDepth
-                            else
-                                isInArray <- false
-                                arrayDepth <- 0
-                            
-                            // Remove the array property from pathStack (e.g., "people")
-                            if pathStack.Count > 0 then
-                                pathStack.RemoveAt(pathStack.Count - 1)
-                            
-                            accumulatedData.Clear()
-                            
-                        | JsonToken.String | JsonToken.Integer | JsonToken.Float | JsonToken.Boolean ->
-                            if not (String.IsNullOrEmpty currentProperty) then
-                                accumulatedData.[currentProperty] <- reader.Value
-                                currentProperty <- ""
-                            
-                            printfn "Value token - Path: '%s', Value: %A" currentPath reader.Value
-                            processJsonToken pool reader.TokenType reader.Value currentPath accumulatedData
-                            
-                        | _ -> ()
-                    
-                    // Step 4: Signal completion to all channels
-                    for channel in pool.Channels do
-                        completeChannel channel
-                    
-                    // Step 5: Wait for all processing to complete
-                    let! _ = Task.WhenAll(pool.ProcessingTasks)
-                    
-                    // Step 6: Final flush
-                    PhysicalDataStructures.flushIfNeeded pool.GlobalPredicateTable output (Dictionary<string, obj>())
-                    
-                with
-                | ex -> return failwithf "Error processing RML stream: %s" ex.Message
+                let objectStack = ResizeArray<Dictionary<string, obj>>()
+                let contextStack = ResizeArray<bool * string * int>()
+                parseLoop pool pathStack objectStack "" false 0 contextStack
+
+                // Step 3: Signal completion to all channels
+                for channel in pool.Channels do
+                    completeChannel channel
+
+                // Step 4: Wait for all processing to complete
+                let! _ = Task.WhenAll(pool.ProcessingTasks)
+
+                // Step 5: Final flush
+                PhysicalDataStructures.forceFlush pool.GlobalPredicateTable output
             }
 
     // Usage example (updated)
@@ -1048,5 +1047,4 @@ module Pipeline =
                     completeEnhancedChannel channel
                 
                 testChannelUsage()
-            }
-            }
+            }            

@@ -11,7 +11,8 @@
             let main argv =
                 let allTests = testList "All RML Tests" [
                     allComputationRMLTests
-                    pipelineModelBasedTests
+                    pipelinePropertyTests
+                    pipelineModelBasedTests                    
                 ]
                 
                 allTests

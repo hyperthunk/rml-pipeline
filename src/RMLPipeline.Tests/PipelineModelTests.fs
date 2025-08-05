@@ -494,6 +494,7 @@ module PipelineModelBased =
                 do! addPredicateObjectMap (simplePredObj foafName "name")
             })) (fun _ -> ())
 
+    [<Tests>]
     let pipelinePropertyTests =
         testList "Pipeline Property-Based Tests" [
             testProperty "can process person data with shrinking" <| 
@@ -607,9 +608,9 @@ module PipelineModelBased =
     [<Tests>]
     let pipelineModelBasedTests =
         testList "Pipeline Model-Based Tests" [
-            debuggingTests
-            pipelinePropertyTests
-            (* testCase "can process real-world person data" <| fun _ ->
+            // debuggingTests
+            // pipelinePropertyTests
+            testCase "can process real-world person data - [pipeline model-based]" <| fun _ ->
                 let mockOutput = MockTripleOutputStream()
                 let json = """{"people": [{"id": "1", "name": "John Doe", "age": 30}]}"""
                 
@@ -802,5 +803,5 @@ module PipelineModelBased =
                         
                         // Should complete without critical errors
                         true
-                    )*)
+                    )
         ]
