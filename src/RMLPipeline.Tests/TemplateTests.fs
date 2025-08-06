@@ -154,7 +154,6 @@ module TemplateTests =
         | :? string as s -> Some (StringValue s)
         | :? int64 as i -> Some (IntValue i)
         | :? float as f -> Some (FloatValue f)
-        | :? double as d -> Some (FloatValue d)
         | :? bool as b -> Some (BoolValue b)
         | :? DateTime as dt -> Some (DateTimeValue dt)
         | :? decimal as d -> Some (DecimalValue d)
