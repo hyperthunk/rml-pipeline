@@ -33,7 +33,8 @@ module TemplateTests =
         | TestDecimalValue d -> DecimalValue d
         | TestNullValue -> NullValue
 
-    type TestTemplate = TestTemplate of string
+    type TestPlainTemplate = TestTemplate of string
+    type TestExpandableTemplate = Expansion of string
 
     // Custom generators that completely avoid FastMap
     module Generators =
@@ -161,6 +162,7 @@ module TemplateTests =
                 Gen.map4 (sprintf "%s{%s}%s{%s}") genLiteral genValidReference genLiteral genValidReference
             ]
             |> Gen.filter (fun s -> not (isNull s) && s.Length <= 200) // Size constraint
+            |> Gen.map Expansion
         
         let genTemplateWithoutPlaceholders =
             Gen.oneof [
@@ -204,6 +206,9 @@ module TemplateTests =
             
         static member Template() = 
             Generators.genTemplateWithoutPlaceholders |> Arb.fromGen
+
+        static member ExpandableTemplate() =
+            Generators.genRMLTemplate |> Arb.fromGen
 
     // Test data for specific scenarios
     let testData = [
@@ -328,11 +333,38 @@ module TemplateTests =
                 | Error _ -> false
             )
 
-        testProperty "Template without placeholders returns original" <| fun (template: TestTemplate) ->
+        testProperty "Template without placeholders returns original" <| fun (template: TestPlainTemplate) ->
             let str = match template with TestTemplate s -> s
             match expandTemplate str Context.empty with
             | Success result -> 
                 if isNull str then result = "" else result = str
+            | Error _ -> false
+
+        testProperty "Template Expansion Load/Regression Ref Handling" <| fun (template: TestExpandableTemplate) ->
+            let str = match template with Expansion s -> s
+            let parsed : Parser.ParseResult list = Parser.parseTemplate str
+            let refs = 
+                parsed
+                |> Seq.map 
+                    (function
+                    | Parser.Literal _ -> None // Empty template is valid
+                    | Parser.Reference s -> Some s
+                    )
+                |> Seq.choose id
+                |> Seq.toList
+            
+            let genContext = 
+                refs
+                |> List.map 
+                    (
+                        fun refName -> 
+                            let testVal = Generators.genNonNullString |> Gen.sample 1 1 |> List.head
+                            refName, StringValue testVal
+                    )
+                |> List.fold (fun acc (k, v) -> Context.add k v acc) Context.empty
+
+            match expandTemplate str genContext with
+            | Success _ -> true
             | Error _ -> false
 
         // Test conversion between TestRMLValue and RMLValue

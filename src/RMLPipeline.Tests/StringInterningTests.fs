@@ -1016,7 +1016,7 @@ module StringPoolTests =
     ]
 
     let modelBasedTests = [
-        testCase "Debug String pool routing" <| fun _ ->
+        (* testCase "Debug String pool routing" <| fun _ ->
             let hierarchy = StringPool.create [||]
             use scope = StringPool.createScope hierarchy None (Some 100)
             
@@ -1042,7 +1042,7 @@ module StringPoolTests =
                 | ValueNone -> 
                     printfn "  Retrieved StringId %d -> NONE" id.Value
             
-            printfn "=== End Debug ===\n"
+            printfn "=== End Debug ===\n" *)
         
         testCase "String pool routing respects access patterns" <| fun _ ->
             let hierarchy = StringPool.create [||]

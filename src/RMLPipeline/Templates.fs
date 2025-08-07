@@ -14,7 +14,7 @@ module Templates =
         let Backslash = '\\'
 
     // RML-compliant template parser
-    module private Parser =
+    module Parser =
         
         type ParseResult = 
             | Literal of string
