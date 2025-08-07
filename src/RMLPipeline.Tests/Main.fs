@@ -2,28 +2,27 @@
 
     module TestRunner =
         open Expecto
+        open RMLPipeline.Tests.VocabSuite
+        open RMLPipeline.Tests.TemplateTests
+        open RMLPipeline.Tests.StringPoolTests
+        open RMLPipeline.Tests.PlannerModelTests
+        // open RMLPipeline.Tests.PipelineModelBased
 
-            open Expecto
-            open RMLPipeline.Tests.VocabSuite
-            open RMLPipeline.Tests.TemplateTests
-            open RMLPipeline.Tests.StringPoolTests
-            // open RMLPipeline.Tests.PipelineModelBased
+        [<EntryPoint>]
+        let main argv =
+            (* let allTests = testList "All RML Tests" [
+                allComputationRMLTests
+                pipelinePropertyTests
+                pipelineModelBasedTests                    
+            ] *)
 
-            [<EntryPoint>]
-            let main argv =
-                (* let allTests = testList "All RML Tests" [
+            let allTests = 
+                testList "RMLPipeline" [
+                    allStringPoolTests
                     allComputationRMLTests
-                    pipelinePropertyTests
-                    pipelineModelBasedTests                    
-                ] *)
-
-                let allTests = 
-                    testList "RMLPipeline" [
-                        allStringPoolTests
-                        allComputationRMLTests
-                        allTemplateTests
-                        
-                    ]
-                
-                allTests
-                |> runTestsWithCLIArgs [] argv
+                    allTemplateTests
+                    allStatefulPlannerTests
+                ]
+            
+            allTests
+            |> runTestsWithCLIArgs [] argv

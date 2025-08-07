@@ -419,6 +419,14 @@ module DSL =
             do! asIRI
         }
         
+        /// Create a simple template term map as literal
+        let templateTermAsLiteral (tmpl: string) = termMap {
+            do! expressionMap (exprMap {
+                do! template tmpl
+            })
+            do! asLiteral
+        }
+
         /// Create a simple reference term map as literal
         let refTermAsLiteral (ref: string) = termMap {
             do! expressionMap (exprMap {
