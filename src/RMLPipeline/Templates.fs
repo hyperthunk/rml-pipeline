@@ -144,7 +144,7 @@ module Templates =
 
     // Tail-recursive template expansion
     let expandTemplate (template: string) (context: Context) : TemplateResult =
-        if String.IsNullOrEmpty(template) then
+        if String.IsNullOrEmpty template then
             Success ""
         else
             try

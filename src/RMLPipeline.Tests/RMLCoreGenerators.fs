@@ -5,6 +5,7 @@ namespace RMLPipeline.Tests
 module RMLCoreGenerators =
 
     open FsCheck
+    open RMLPipeline.Core
     open RMLPipeline.Model
     open RMLPipeline.DSL
     open System
