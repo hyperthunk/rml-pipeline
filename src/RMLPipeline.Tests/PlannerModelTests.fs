@@ -128,7 +128,8 @@ module PlannerModelTests =
         let extractPlanContract (plan: RMLPlan) : PlanContract =
             let hasValidStructure = 
                 plan.OrderedMaps.Length >= 0 &&
-                plan.DependencyGroups.GroupStarts.Length > 0 &&
+                // Dependency groups length should match the presence of maps
+                (plan.OrderedMaps.Length = 0) = (plan.DependencyGroups.GroupStarts.Length = 0) &&
                 plan.StringPoolHierarchy <> Unchecked.defaultof<_>
             
             let supportsBoundsChecking = 
@@ -161,33 +162,56 @@ module PlannerModelTests =
         
         (* Test behavioral invariants rather than implementation details *)
         let verifyPlanInvariants (plan: RMLPlan) : bool =
-            // Invariant: All maps must have consistent StringPool integration
-            plan.OrderedMaps |> Array.forall (fun mapPlan ->
-                PlanUtils.getString plan mapPlan.IteratorPathId |> Option.isSome) &&
+            // Invariant 1: All maps must have consistent StringPool integration
+            let stringPoolCheck = 
+                plan.OrderedMaps |> Array.forall (fun mapPlan ->
+                    PlanUtils.getString plan mapPlan.IteratorPathId |> Option.isSome)
             
-            // Invariant: Dependency groups must be non-overlapping and complete
-            let allGroupMembers = 
-                [| for i = 0 to plan.DependencyGroups.GroupStarts.Length - 1 do
-                    yield! plan.DependencyGroups.GetGroup(i) |]
-                |> Array.sort
-            let expectedMembers = [| 0 .. plan.OrderedMaps.Length - 1 |]
-            allGroupMembers = expectedMembers &&
+            // Invariant 2: Dependency groups must be non-overlapping and complete
+            let dependencyGroupCheck = 
+                let allGroupMembers = 
+                    [| for i = 0 to plan.DependencyGroups.GroupStarts.Length - 1 do
+                        yield! plan.DependencyGroups.GetGroup(i) |]
+                    |> Array.sort
+                let expectedMembers = [| 0 .. plan.OrderedMaps.Length - 1 |]
+                allGroupMembers = expectedMembers
             
-            // Invariant: Hash values must be deterministic
-            plan.OrderedMaps |> Array.forall (fun mapPlan ->
-                mapPlan.PredicateTuples |> Array.forall (fun tuple ->
-                    let recomputedHash = 
-                        uint64 tuple.SubjectTemplateId.Value ^^^
-                        (uint64 tuple.PredicateValueId.Value <<< 1) ^^^
-                        (uint64 tuple.ObjectTemplateId.Value <<< 2) ^^^
-                        (uint64 tuple.SourcePathId.Value <<< 3)
-                    tuple.Hash = recomputedHash)) &&
+            // Invariant 3: Hash values must be deterministic
+            let hashConsistencyCheck = 
+                plan.OrderedMaps |> Array.forall (fun mapPlan ->
+                    mapPlan.PredicateTuples |> Array.forall (fun tuple ->
+                        let recomputedHash = 
+                            uint64 tuple.SubjectTemplateId.Value ^^^
+                            (uint64 tuple.PredicateValueId.Value <<< 1) ^^^
+                            (uint64 tuple.ObjectTemplateId.Value <<< 2) ^^^
+                            (uint64 tuple.SourcePathId.Value <<< 3)
+                        tuple.Hash = recomputedHash))
             
-            // Invariant: Memory mode configuration is respected
-            match plan.Config.MemoryMode with
-            | LowMemory -> plan.Config.ChunkSize <= 100
-            | HighPerformance -> plan.Config.ChunkSize >= 100
-            | Balanced -> true // No specific constraints for balanced mode
+            // Invariant 4: Memory mode configuration is respected
+            let memoryModeCheck = 
+                match plan.Config.MemoryMode with
+                | LowMemory -> plan.Config.ChunkSize <= 100
+                | HighPerformance -> plan.Config.ChunkSize >= 100
+                | Balanced -> true // No specific constraints for balanced mode
+            
+            // Debug output for failing plans
+            let allChecksPass = stringPoolCheck && dependencyGroupCheck && hashConsistencyCheck && memoryModeCheck
+            if not allChecksPass then
+                printfn "INVARIANT DEBUG: stringPool=%b, depGroups=%b, hash=%b, memMode=%b"
+                        stringPoolCheck dependencyGroupCheck hashConsistencyCheck memoryModeCheck
+                
+                if not dependencyGroupCheck then
+                    let allGroupMembers = 
+                        [| for i = 0 to plan.DependencyGroups.GroupStarts.Length - 1 do
+                            yield! plan.DependencyGroups.GetGroup(i) |]
+                        |> Array.sort
+                    let expectedMembers = [| 0 .. plan.OrderedMaps.Length - 1 |]
+                    printfn "DEPENDENCY DEBUG: expected=%A, actual=%A" expectedMembers allGroupMembers
+                
+                if not memoryModeCheck then
+                    printfn "MEMORY MODE DEBUG: mode=%A, chunkSize=%d" plan.Config.MemoryMode plan.Config.ChunkSize
+            
+            allChecksPass
         
         let verifyIndexConsistency (plan: RMLPlan) : bool =
             // Test that index strategies are consistently applied
@@ -985,7 +1009,7 @@ module PlannerModelTests =
                     contract.MemoryMode = actualPlan.Config.MemoryMode)
             )
 
-        ftestProperty "Plan invariants are maintained across operations" <| fun () ->
+        testProperty "Plan invariants are maintained across operations" <| fun () ->
             gen {
                 let! maps = genTriplesMapSet
                 let! config = genPlannerConfig
@@ -1017,11 +1041,20 @@ module PlannerModelTests =
                     |> List.fold (fun state command -> runCommand command state) ActualState.Initial
                 
                 // Verify structural integrity across all operations
-                finalState.Plans |> Map.forall (fun _ plan ->
-                    PlanVerification.verifyPlanInvariants plan &&
-                    PlanVerification.verifyHashConsistency plan &&
-                    PlanVerification.verifyJoinHashConsistency plan &&
-                    PlanVerification.verifyStringPoolIntegrity plan)
+                finalState.Plans |> Map.forall (fun planId plan ->
+                    let invariants = PlanVerification.verifyPlanInvariants plan
+                    let hashConsistency = PlanVerification.verifyHashConsistency plan
+                    let joinHashConsistency = PlanVerification.verifyJoinHashConsistency plan
+                    let stringPoolIntegrity = PlanVerification.verifyStringPoolIntegrity plan
+                    
+                    if not (invariants && hashConsistency && joinHashConsistency && stringPoolIntegrity) then
+                        printfn "Plan %A failed verification: invariants=%b, hash=%b, joinHash=%b, stringPool=%b"
+                                planId invariants hashConsistency joinHashConsistency stringPoolIntegrity
+                        printfn "Plan details: maps=%d, depGroups=%d, memMode=%A, chunkSize=%d"
+                                plan.OrderedMaps.Length plan.DependencyGroups.GroupStarts.Length 
+                                plan.Config.MemoryMode plan.Config.ChunkSize
+                    
+                    invariants && hashConsistency && joinHashConsistency && stringPoolIntegrity)
             )
     ]
 

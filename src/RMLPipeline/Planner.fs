@@ -1039,8 +1039,16 @@ module Planner =
     /// Create an optimized plan for the given triples maps
     /// </summary>
     let createRMLPlan (triplesMaps: TriplesMap[]) (config: PlannerConfig) : RMLPlan =
-        printfn "Creating optimized RML plan with %A memory mode..." config.MemoryMode
-        let plan = createMemoryOptimizedPlan triplesMaps config
+        let validatedConfig = 
+            match config.MemoryMode with
+            | LowMemory when config.ChunkSize > 100 -> 
+                { config with ChunkSize = 100 }
+            | HighPerformance when config.ChunkSize < 100 ->
+                { config with ChunkSize = 100 }
+            | _ -> config
+        
+        printfn "Creating optimized RML plan with %A memory mode..." validatedConfig.MemoryMode
+        let plan = createMemoryOptimizedPlan triplesMaps validatedConfig
         
         let globalStats = StringPool.getGlobalStats plan.StringPoolHierarchy
         printfn "  - %d triples maps" plan.OrderedMaps.Length
@@ -1054,7 +1062,11 @@ module Planner =
     /// Create a streaming plan for memory-constrained environments
     /// </summary>
     let createStreamingPlan (triplesMaps: TriplesMap[]) (config: PlannerConfig) : seq<RMLPlan> =
-        let streamConfig = { config with MemoryMode = LowMemory }        
+        let streamConfig = 
+            { 
+                config with MemoryMode = LowMemory; 
+                            ChunkSize = min config.ChunkSize 100 
+            }
         seq {
             for chunk in triplesMaps |> Array.chunkBySize streamConfig.ChunkSize do
                 yield createRMLPlan chunk streamConfig
