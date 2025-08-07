@@ -56,3 +56,4 @@ nunit-*.xml
 
 .fake
 /src/copilot
+/src/playground
