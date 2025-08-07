@@ -9,8 +9,11 @@
     <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="RMLCoreGenerators.fs" />
     <Compile Include="RMLVocabTests.fs" />
     <Compile Include="TemplateTests.fs" />
+    <Compile Include="StringInterningTests.fs" />
+    <!-- <Compile Include="PipelineModelTests.fs" /> -->
     <Compile Include="Main.fs" />
   </ItemGroup>
   <ItemGroup>
