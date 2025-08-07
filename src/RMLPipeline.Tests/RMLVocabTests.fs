@@ -482,7 +482,7 @@ namespace RMLPipeline.Tests
 
         [<Tests>]
         let allComputationRMLTests = 
-            testList "All ComputationRML Tests" [
+            testList "Vocabulary" [
                 expressionMapTests
                 termMapTests
                 subjectMapTests

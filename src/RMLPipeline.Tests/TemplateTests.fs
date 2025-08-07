@@ -587,12 +587,12 @@ module TemplateTests =
     // Combine all tests
     [<Tests>]
     let allTemplateTests = 
-        testList "Template and Type System Tests" [
-            testList "Property-based tests" propertyTests
-            testList "Specific functionality tests" specificTests  
-            testList "JSON parsing simulation tests" jsonSimulationTests
-            testList "Edge case tests" edgeCaseTests
-            testList "Performance tests" performanceTests
+        testList "Templates" [
+            testList "FsCheck" propertyTests
+            testList "BasicFunctionality" specificTests  
+            testList "JSONParsingSimulation" jsonSimulationTests
+            testList "EdgeCases" edgeCaseTests
+            testList "Robustness" performanceTests
         ]
 
     // Register arbitraries for FsCheck - Only simple types, no FastMap

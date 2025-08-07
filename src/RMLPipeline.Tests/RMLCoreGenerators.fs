@@ -7,7 +7,6 @@ module RMLCoreGenerators =
     open FsCheck
     open RMLPipeline.Model
     open RMLPipeline.DSL
-    open RMLPipeline.Core
     open System
 
     let genIdentifier = 

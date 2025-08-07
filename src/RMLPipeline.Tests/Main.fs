@@ -18,12 +18,12 @@
                 ] *)
 
                 let allTests = 
-                    testList "All RML Tests" [
-                        (* allComputationRMLTests
-                        allTemplateTests *)
+                    testList "RMLPipeline" [
                         allStringPoolTests
+                        allComputationRMLTests
+                        allTemplateTests
+                        
                     ]
                 
-                allComputationRMLTests
-                |> Test.shuffle defaultConfig.joinWith.asString
+                allTests
                 |> runTestsWithCLIArgs [] argv

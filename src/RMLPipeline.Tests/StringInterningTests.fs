@@ -1077,12 +1077,12 @@ module StringPoolTests =
 
     [<Tests>]
     let allStringPoolTests = 
-        testList "String Pool Comprehensive Tests" [
-            testList "Property-based tests" propertyTests
-            testList "Bugfix tests" bugfixTests
-            testList "Performance and stress tests" performanceTests
-            testList "Error handling and edge cases" edgeCaseTests
-            testList "Model-based tests" modelBasedTests
+        testList "StringPool" [
+            testList "FsCheck" propertyTests
+            testList "Bugfix" bugfixTests
+            testList "Robustness" performanceTests
+            testList "EdgeCases" edgeCaseTests
+            testList "ModelTests" modelBasedTests
         ]
 
 // In StringInterningTests.fs, update the registration at the bottom:

@@ -47,6 +47,7 @@ open System
 open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Threading
+open System.Runtime.CompilerServices
 open RMLPipeline
 open RMLPipeline.FastMap.Types
 
@@ -102,7 +103,7 @@ type GlobalPoolSnapshot = {
 }
 
 module IdAllocation =
-    // Fixed ranges to prevent ID collisions between pool tiers
+    // Fixed ranges that prevent ID collisions between pool tiers
     let GlobalRuntimeBase = 50000      // Reserve 50K IDs for global runtime strings
     let GroupPoolBase = 100000         // Start group pools at 100K
     let LocalPoolBase = 500000         // Start local pools at 500K
@@ -158,17 +159,22 @@ type GlobalStringPool = private {
             NextRuntimeId = planningStrings.Length
         }
     
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member this.TryGetString(id: StringId) : string voption =
         if id.Value >= 0 && id.Value < this.PlanningArray.Length then
             ValueSome this.PlanningArray.[id.Value]
         else
             let runtimeIndex = id.Value - this.PlanningArray.Length
-            lock this.RuntimeLock (fun () ->
-                if runtimeIndex >= 0 && runtimeIndex < this.RuntimeArray.Count then
-                    ValueSome this.RuntimeArray.[runtimeIndex]
-                else
-                    ValueNone)
+            if runtimeIndex >= 0 then
+                lock this.RuntimeLock (fun () ->
+                    if runtimeIndex < this.RuntimeArray.Count then
+                        ValueSome this.RuntimeArray.[runtimeIndex]
+                    else
+                        ValueNone)
+            else
+                ValueNone
     
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member this.TryIntern(str: string) : StringId =
         if isNull str || str.Length = 0 then
             raise (ArgumentException "String cannot be null or empty")
@@ -185,24 +191,28 @@ type GlobalStringPool = private {
                 id
             | (false, _) ->
                 // Add to runtime strings (synchronized)
-                lock this.RuntimeLock (fun () ->
-                    // Double-check after acquiring lock
-                    match this.RuntimeStrings.TryGetValue(str) with
-                    | (true, id) -> 
-                        Interlocked.Increment(&this.Stats.AccessCount) |> ignore
-                        id
-                    | (false, _) ->
-                        // Ensure we don't exceed reserved global range
-                        if this.NextRuntimeId >= IdAllocation.GlobalRuntimeBase then
-                            raise (InvalidOperationException "Global runtime string pool exhausted")
-                        
-                        let newId = StringId this.NextRuntimeId
-                        this.NextRuntimeId <- this.NextRuntimeId + 1
-                        this.RuntimeArray.Add(str)
-                        this.RuntimeStrings.[str] <- newId
-                        Interlocked.Increment(&this.Version) |> ignore
-                        Interlocked.Increment(&this.Stats.MissCount) |> ignore
-                        newId)
+                this.InternNewString(str)
+    
+    member private this.InternNewString(str: string) : StringId =
+        lock this.RuntimeLock (fun () ->
+            // Double-check after acquiring lock
+            match this.RuntimeStrings.TryGetValue(str) with
+            | (true, id) -> 
+                Interlocked.Increment(&this.Stats.AccessCount) |> ignore
+                id
+            | (false, _) ->
+                // Ensure we don't exceed reserved global range
+                if this.NextRuntimeId >= IdAllocation.GlobalRuntimeBase then
+                    raise (InvalidOperationException "Global runtime string pool exhausted")
+                
+                let newId = StringId this.NextRuntimeId
+                this.NextRuntimeId <- this.NextRuntimeId + 1
+                this.RuntimeArray.Add(str)
+                this.RuntimeStrings.[str] <- newId
+                Interlocked.Increment(&this.Version) |> ignore
+                Interlocked.Increment(&this.Stats.MissCount) |> ignore
+                Interlocked.Increment(&this.Stats.AccessCount) |> ignore
+                newId)
     
     member this.GetSnapshot() : GlobalPoolSnapshot =
         {
@@ -244,7 +254,7 @@ type WorkerGroupPool = private {
     // Group-specific strings with fixed ID range
     GroupStrings: ConcurrentDictionary<string, StringId>
     GroupArray: ResizeArray<string>
-    GroupLock: obj
+    GroupLock: ReaderWriterLockSlim
     GroupBaseId: int
     
     mutable Stats: PoolStats
@@ -256,7 +266,7 @@ type WorkerGroupPool = private {
             BaseSnapshot = globalPool.GetSnapshot()
             GroupStrings = ConcurrentDictionary<string, StringId>()
             GroupArray = ResizeArray<string>()
-            GroupLock = obj()
+            GroupLock = new ReaderWriterLockSlim()
             GroupBaseId = IdAllocation.getGroupPoolBaseId groupId
             Stats = PoolStats.Empty
         }
@@ -265,14 +275,17 @@ type WorkerGroupPool = private {
         // Smart refresh: update snapshot if global pool has grown significantly
         let currentSnapshot = this.GlobalPoolRef.GetSnapshot()
         if currentSnapshot.Version > this.BaseSnapshot.Version + 5L then
-            lock this.GroupLock (fun () ->
+            this.GroupLock.EnterWriteLock()
+            try
                 // Double-check after acquiring lock
                 let latestSnapshot = this.GlobalPoolRef.GetSnapshot()
                 if latestSnapshot.Version > this.BaseSnapshot.Version then
                     this.BaseSnapshot <- latestSnapshot
-            )
+            finally
+                this.GroupLock.ExitWriteLock()
         this.BaseSnapshot.StringCount
     
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member this.TryGetString(id: StringId) : string voption =
         if id.Value < 0 then ValueNone
         else
@@ -280,15 +293,19 @@ type WorkerGroupPool = private {
             if id.Value >= this.GroupBaseId && id.Value < this.GroupBaseId + IdAllocation.GroupPoolRangeSize then
                 // This is a group pool ID
                 let groupIndex = id.Value - this.GroupBaseId
-                lock this.GroupLock (fun () ->
+                this.GroupLock.EnterReadLock()
+                try
                     if groupIndex >= 0 && groupIndex < this.GroupArray.Count then
                         ValueSome this.GroupArray.[groupIndex]
                     else
-                        ValueNone)
+                        ValueNone
+                finally
+                    this.GroupLock.ExitReadLock()
             else
                 // Try global pool
                 this.GlobalPoolRef.TryGetString(id)
     
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member this.TryIntern(str: string, accessPattern: StringAccessPattern) : StringId =
         if isNull str || str.Length = 0 then
             raise (ArgumentException "String cannot be null or empty")
@@ -313,7 +330,8 @@ type WorkerGroupPool = private {
                     globalId
                 | ValueNone ->
                     // Add to group-specific strings
-                    lock this.GroupLock (fun () ->
+                    this.GroupLock.EnterWriteLock()
+                    try
                         match this.GroupStrings.TryGetValue(str) with
                         | (true, id) -> 
                             Interlocked.Increment(&this.Stats.AccessCount) |> ignore
@@ -327,14 +345,19 @@ type WorkerGroupPool = private {
                             this.GroupArray.Add(str)
                             this.GroupStrings.[str] <- newId
                             Interlocked.Increment(&this.Stats.MissCount) |> ignore
-                            newId)
+                            Interlocked.Increment(&this.Stats.AccessCount) |> ignore
+                            newId
+                    finally
+                        this.GroupLock.ExitWriteLock()
     
     member this.GetStats() : PoolStats = 
         let groupMemory = 
-            lock this.GroupLock (fun () ->
+            this.GroupLock.EnterReadLock()
+            try
                 this.GroupArray
                 |> Seq.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2))
-            )
+            finally
+                this.GroupLock.ExitReadLock()
         
         // Calculate hit ratio for this pool
         let hitRatio = 
@@ -353,6 +376,9 @@ type WorkerGroupPool = private {
     member this.ShouldRefresh() : bool =
         let currentSnapshot = this.GlobalPoolRef.GetSnapshot()
         currentSnapshot.Version > this.BaseSnapshot.Version
+    
+    interface IDisposable with
+        member this.Dispose() = this.GroupLock.Dispose()
 
 type WorkerLocalPool = private {
     WorkerId: WorkerId
@@ -361,7 +387,8 @@ type WorkerLocalPool = private {
     
     // Fast local lookup with fixed ID range
     LocalStrings: Dictionary<string, StringId>
-    LocalArray: ResizeArray<string>
+    LocalArray: string[]
+    mutable LocalCount: int
     
     // Configuration
     MaxLocalStrings: int
@@ -373,6 +400,7 @@ type WorkerLocalPool = private {
                          globalPool: GlobalStringPool, 
                          groupPool: WorkerGroupPool option, 
                          maxLocalStrings: int option) =
+        let maxLocal = min (Option.defaultValue 1000 maxLocalStrings) IdAllocation.WorkerRangeSize
         let localBaseId = 
             groupPool 
             |> Option.map (fun gp -> gp.GroupId)
@@ -382,30 +410,30 @@ type WorkerLocalPool = private {
             WorkerId = workerId
             GroupPoolRef = groupPool
             GlobalPoolRef = globalPool
-            LocalStrings = Dictionary<string, StringId>()
-            LocalArray = ResizeArray<string>()
-            MaxLocalStrings = min (Option.defaultValue 1000 maxLocalStrings) IdAllocation.WorkerRangeSize
+            LocalStrings = Dictionary<string, StringId>(maxLocal)
+            LocalArray = Array.zeroCreate maxLocal
+            LocalCount = 0
+            MaxLocalStrings = maxLocal
             LocalPoolBaseId = localBaseId
             Stats = PoolStats.Empty
         }
     
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member this.TryGetString(id: StringId) : string voption =
         if id.Value < 0 then ValueNone
         else
             // Check if this ID belongs to our local pool range
-            if id.Value >= this.LocalPoolBaseId && id.Value < this.LocalPoolBaseId + IdAllocation.WorkerRangeSize then
+            if id.Value >= this.LocalPoolBaseId && id.Value < this.LocalPoolBaseId + this.LocalCount then
                 // This is a local pool ID
                 let localIndex = id.Value - this.LocalPoolBaseId
-                if localIndex >= 0 && localIndex < this.LocalArray.Count then
-                    ValueSome this.LocalArray.[localIndex]
-                else
-                    ValueNone
+                ValueSome this.LocalArray.[localIndex]
             else
                 // Try group pool first (if available)
                 match this.GroupPoolRef with
                 | Some groupPool -> groupPool.TryGetString(id)
                 | None -> this.GlobalPoolRef.TryGetString(id)
     
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member this.TryIntern(str: string, accessPattern: StringAccessPattern) : StringId =
         if isNull str || str.Length = 0 then
             raise (ArgumentException "String cannot be null or empty")
@@ -415,33 +443,35 @@ type WorkerLocalPool = private {
             | (true, id) -> 
                 this.Stats.AccessCount <- this.Stats.AccessCount + 1L
                 id
-            | (false, _) when this.LocalStrings.Count < this.MaxLocalStrings ->
+            | (false, _) when this.LocalCount < this.MaxLocalStrings ->
                 // Add to local pool using fixed range
-                let newId = StringId (this.LocalPoolBaseId + this.LocalArray.Count)
-                this.LocalArray.Add(str)
+                let newId = StringId (this.LocalPoolBaseId + this.LocalCount)
+                this.LocalArray.[this.LocalCount] <- str
                 this.LocalStrings.[str] <- newId
+                this.LocalCount <- this.LocalCount + 1
                 this.Stats.MissCount <- this.Stats.MissCount + 1L
+                this.Stats.AccessCount <- this.Stats.AccessCount + 1L
                 newId
             | (false, _) ->
                 // Local pool full, delegate to parent pools
+                this.Stats.AccessCount <- this.Stats.AccessCount + 1L
                 this.delegateToParent(str, accessPattern)
         else
             // Medium/low frequency: delegate to parent pools
+            this.Stats.AccessCount <- this.Stats.AccessCount + 1L
             this.delegateToParent(str, accessPattern)
     
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private this.delegateToParent(str: string, accessPattern: StringAccessPattern) : StringId =
         match this.GroupPoolRef with
-        | Some groupPool -> 
-            this.Stats.AccessCount <- this.Stats.AccessCount + 1L
-            groupPool.TryIntern(str, accessPattern)
-        | None -> 
-            this.Stats.AccessCount <- this.Stats.AccessCount + 1L
-            this.GlobalPoolRef.TryIntern(str)
+        | Some groupPool -> groupPool.TryIntern(str, accessPattern)
+        | None -> this.GlobalPoolRef.TryIntern(str)
     
     member this.GetStats() : PoolStats = 
         let localMemory = 
             this.LocalArray
-            |> Seq.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2))
+            |> Array.take this.LocalCount
+            |> Array.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2))
         
         // Calculate hit ratio for this pool
         let hitRatio = 
@@ -450,7 +480,7 @@ type WorkerLocalPool = private {
             else 0.0
         
         { 
-            TotalStrings = this.LocalArray.Count
+            TotalStrings = this.LocalCount
             MemoryUsageBytes = localMemory
             HitRatio = hitRatio
             AccessCount = this.Stats.AccessCount
@@ -464,7 +494,6 @@ type ExecutionContext = {
     ParentPoolRef: WorkerGroupPool option
     GlobalPoolRef: GlobalStringPool
 } with
-    
     static member Create(globalPool: GlobalStringPool, 
                          groupId: DependencyGroupId option, 
                          maxLocalStrings: int option) =
