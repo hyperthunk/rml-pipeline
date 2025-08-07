@@ -672,18 +672,28 @@ module Planner =
     // ------------------------------------------------------------------------
     
     let private buildPredicateIndex (plans: TriplesMapPlan[]) : FastMap<uint64, PredicateTuple[]> =
-        plans
-        |> Array.collect (_.PredicateTuples)
-        |> Array.groupBy (_.Hash)
-        |> Array.fold (fun acc (hash, tuples) ->
-            FastMap.add hash tuples acc) FastMap.empty
-    
+        // Only build indexes for plans that actually need them
+        let indexedPlans = plans |> Array.filter (fun p -> p.IndexStrategy <> NoIndex)
+        if indexedPlans.Length = 0 then
+            FastMap.empty
+        else
+            indexedPlans
+            |> Array.collect (_.PredicateTuples)
+            |> Array.groupBy (_.Hash)
+            |> Array.fold (fun acc (hash, tuples) ->
+                FastMap.add hash tuples acc) FastMap.empty
+
     let private buildJoinIndex (plans: TriplesMapPlan[]) : FastMap<uint64, JoinTuple[]> =
-        plans
-        |> Array.collect (_.JoinTuples)
-        |> Array.groupBy (_.Hash)
-        |> Array.fold (fun acc (hash, tuples) ->
-            FastMap.add hash tuples acc) FastMap.empty
+        // Only build join indexes for FullIndex plans
+        let fullIndexPlans = plans |> Array.filter (fun p -> p.IndexStrategy = FullIndex)
+        if fullIndexPlans.Length = 0 then
+            FastMap.empty
+        else
+            fullIndexPlans
+            |> Array.collect (_.JoinTuples)
+            |> Array.groupBy (_.Hash)
+            |> Array.fold (fun acc (hash, tuples) ->
+                FastMap.add hash tuples acc) FastMap.empty
     
     let private buildPathIndex (plans: TriplesMapPlan[]) : FastMap<StringId, int[]> =
         plans
@@ -692,7 +702,6 @@ module Planner =
         |> Array.map (fun (pathId, pairs) -> (pathId, pairs |> Array.map snd))
         |> Array.fold (fun acc (pathId, indices) ->
             FastMap.add pathId indices acc) FastMap.empty
-    
     
     (* 
         Memory Mode Optimized Planning:
@@ -788,32 +797,38 @@ module Planner =
         }
     
     let executeHotPath (plan: RMLPlan) : unit =
-        // Allocate stack space (configurable based on memory mode)
         let stackSize = 
             match plan.Config.MemoryMode with
-            | LowMemory -> 4096    // 4KB
-            | Balanced -> 8192     // 8KB  
-            | HighPerformance -> 16384 // 16KB
+            | LowMemory -> 4096
+            | Balanced -> 8192
+            | HighPerformance -> 16384
         
         let stack = HotPathStack.Create(stackSize)
         
-        // Direct access to StringPool hierarchy for read-only string resolution
-        (* let stringPool = plan.StringPoolHierarchy
-        let planningContext = plan.PlanningContext *)
+        let predicateIndex = 
+            match plan.Config.IndexStrategy with
+            | Some NoIndex -> None
+            | _ -> 
+                let index = plan.GetPredicateIndex()
+                if FastMap.isEmpty index then None else Some index
         
         let rec processGroups groupIndex =
             if groupIndex < plan.DependencyGroups.GroupStarts.Length then
                 let groupMembers = plan.DependencyGroups.GetGroup(groupIndex)
                 processMaps groupMembers 0
-                processGroups (groupIndex + 1)
-        
+                processGroups (groupIndex + 1)        
         and processMaps (groupMembers: int[]) mapIndex =
             if mapIndex < groupMembers.Length then
-                let mapPlan = plan.OrderedMaps.[groupMembers.[mapIndex]]
-                processTuples mapPlan.PredicateTuples 0
-                processMaps groupMembers (mapIndex + 1)
-        
-        and processTuples (tuples: PredicateTuple[]) tupleIndex =
+                let mapPlan = plan.OrderedMaps.[groupMembers.[mapIndex]]                
+                match mapPlan.IndexStrategy, predicateIndex with
+                | NoIndex, _ -> 
+                    processTuplesSequential mapPlan.PredicateTuples 0
+                | (HashIndex | FullIndex), Some index -> 
+                    processTuplesIndexed mapPlan.PredicateTuples index
+                | (HashIndex | FullIndex), None -> 
+                    processTuplesSequential mapPlan.PredicateTuples 0                
+                processMaps groupMembers (mapIndex + 1)        
+        and processTuplesSequential (tuples: PredicateTuple[]) tupleIndex =
             if tupleIndex < tuples.Length then
                 let tuple = tuples.[tupleIndex]
                 let hotTuple = {
@@ -825,26 +840,45 @@ module Planner =
                     Flags = tuple.Flags
                 }
                 processHotPathTuple hotTuple
-                processTuples tuples (tupleIndex + 1)
-        
-        and processHotPathTuple (tuple: HotPathTuple) =
-            (* 
-                Stack operations on mutable stack - we previously did this 
-                with stackalloc<byte>, however the interop made for enough pain
-                that the shift to BitConverter and small performance hit is paid
-                for by simpler debugging and cross-platform compatibility. 
-            *)
-            stack.Push tuple.Hash
+                processTuplesSequential tuples (tupleIndex + 1)        
+        and processTuplesIndexed (tuples: PredicateTuple[]) (index: FastMap<uint64, PredicateTuple[]>) =
+            let processedHashes = ResizeArray<uint64>()
             
+            for tuple in tuples do
+                if not (processedHashes.Contains(tuple.Hash)) then
+                    processedHashes.Add(tuple.Hash)
+                    
+                    match FastMap.tryFind tuple.Hash index with
+                    | ValueSome relatedTuples ->
+                        for relatedTuple in relatedTuples do
+                            let hotTuple = {
+                                HotPathTuple.SubjectTemplateId = relatedTuple.SubjectTemplateId
+                                PredicateValueId = relatedTuple.PredicateValueId
+                                ObjectTemplateId = relatedTuple.ObjectTemplateId
+                                SourcePathId = relatedTuple.SourcePathId
+                                Hash = relatedTuple.Hash
+                                Flags = relatedTuple.Flags
+                            }
+                            processHotPathTuple hotTuple
+                    | ValueNone ->
+                        let hotTuple = {
+                            HotPathTuple.SubjectTemplateId = tuple.SubjectTemplateId
+                            PredicateValueId = tuple.PredicateValueId
+                            ObjectTemplateId = tuple.ObjectTemplateId
+                            SourcePathId = tuple.SourcePathId
+                            Hash = tuple.Hash
+                            Flags = tuple.Flags
+                        }
+                        processHotPathTuple hotTuple        
+        and processHotPathTuple (tuple: HotPathTuple) =
+            stack.Push tuple.Hash            
             if tuple.Flags &&& TupleFlags.IsConstant <> TupleFlags.None then
-                // Fast path for constants - minimal processing
                 stack.Pop() |> ignore
             else
-                // Complex processing path using StringId values directly
                 stack.Push(uint64 tuple.SubjectTemplateId.Value)
                 stack.Push(uint64 tuple.PredicateValueId.Value)
                 stack.Push(uint64 tuple.ObjectTemplateId.Value)
-                stack.Push(uint64 tuple.SourcePathId.Value)  // ADD THIS LINE!
+                stack.Push(uint64 tuple.SourcePathId.Value)
                 
                 let hasJoin = tuple.Flags &&& TupleFlags.HasJoin <> TupleFlags.None
                 if hasJoin then
@@ -858,7 +892,6 @@ module Planner =
                         subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
                     ignore (computedHash = originalHash)
                 else
-                    // Validation pathway
                     let sourceHash = stack.Pop()
                     let objectHash = stack.Pop()
                     let predicateHash = stack.Pop()
@@ -870,7 +903,6 @@ module Planner =
                     
                     ignore (computedHash = originalHash)
         
-        // TCO
         processGroups 0
     
     /// <summary>
