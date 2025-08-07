@@ -376,14 +376,29 @@ module Planner =
         
         strings.ToArray() |> Array.distinct
     
-    let private groupByDependenciesTailRec (plans: TriplesMapPlan[]) : DependencyGroups =
-        let rec buildGroups (remaining: int list) (visited: Set<int>) (groups: int list list) =
+    (*
+        Maps with no dependencies get placed in their own individual groups.
+        Maps with dependencies get grouped together with their dependencies.
+        The algorithm ensures every map appears in exactly one group.
+
+        Maps with no dependencies can run completely independently, while maps 
+        with dependencies must be grouped together for proper execution ordering
+        in a parallel processing pipeline.
+    *)
+    let private groupByDependencies (plans: TriplesMapPlan[]) : DependencyGroups =
+        let rec buildGroups 
+                (remaining: int list) 
+                (visited: Set<int>) 
+                (groups: int list list) =
             match remaining with
             | [] -> groups |> List.rev
             | index :: rest when Set.contains index visited -> 
                 buildGroups rest visited groups
             | index :: rest ->
-                let rec collectGroup (toVisit: int list) (currentGroup: int list) (localVisited: Set<int>) =
+                let rec collectGroup 
+                        (toVisit: int list) 
+                        (currentGroup: int list) 
+                        (localVisited: Set<int>) =
                     match toVisit with
                     | [] -> (currentGroup |> List.rev, localVisited)
                     | idx :: remaining when Set.contains idx localVisited ->
@@ -392,9 +407,12 @@ module Planner =
                         let newGroup = idx :: currentGroup
                         let newVisited = Set.add idx localVisited
                         let dependencies = 
-                            if idx < plans.Length then plans.[idx].Dependencies |> Array.toList
+                            if idx < plans.Length then 
+                                plans.[idx].Dependencies |> Array.toList
                             else []
-                        let unvisitedDeps = dependencies |> List.filter (fun dep -> not (Set.contains dep localVisited))
+                        let unvisitedDeps = 
+                            dependencies 
+                            |> List.filter (fun dep -> not (Set.contains dep localVisited))
                         collectGroup (unvisitedDeps @ remaining) newGroup newVisited
                 
                 let (group, groupVisited) = collectGroup [index] [] visited
@@ -408,13 +426,12 @@ module Planner =
             |> List.scan (+) 0
             |> List.take allGroups.Length
             |> List.toArray
-        
         {
             GroupStarts = groupStarts
             GroupMembers = flatMembers
         }
     
-    let private detectOverlapsTailRec (plans: TriplesMapPlan[]) : struct (int * int * float)[] =
+    let private detectOverlaps (plans: TriplesMapPlan[]) : struct (int * int * float)[] =
         let rec calculateOverlaps (i: int) (j: int) (acc: struct (int * int * float) list) =
             if i >= plans.Length then acc |> List.rev |> List.toArray
             elif j >= plans.Length then calculateOverlaps (i + 1) (i + 2) acc
@@ -465,7 +482,7 @@ module Planner =
         let iteratorPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
         let iteratorPathId = poolScope.InternString(iteratorPath, StringAccessPattern.Planning)
         
-        let subjectTemplate, subjectTemplateId = 
+        let _, subjectTemplateId = 
             match triplesMap.SubjectMap with
             | Some sm -> 
                 match sm.SubjectTermMap.ExpressionMap.Template with
@@ -525,7 +542,7 @@ module Planner =
                 
                 // Process static predicates with object templates
                 for objMap in pom.ObjectMap do
-                    let objTemplate, objTemplateId, flags = 
+                    let _, objTemplateId, flags = 
                         match objMap.ObjectTermMap.ExpressionMap.Template with
                         | Some template -> 
                             let id = poolScope.InternString(template, StringAccessPattern.Planning)
@@ -571,7 +588,10 @@ module Planner =
         
         tuples.ToArray()
     
-    let private extractJoinTuples (triplesMaps: TriplesMap[]) (mapIndex: int) (poolScope: PoolContextScope) : JoinTuple[] =
+    let private extractJoinTuples 
+            (triplesMaps: TriplesMap[]) 
+            (mapIndex: int) 
+            (poolScope: PoolContextScope) : JoinTuple[] =
         let joinTuples = ResizeArray<JoinTuple>()
         let triplesMap = triplesMaps.[mapIndex]
         
@@ -640,7 +660,11 @@ module Planner =
         
         complexity
     
-    let private createTriplesMapPlan (index: int) (triplesMap: TriplesMap) (poolScope: PoolContextScope) (config: PlannerConfig) : TriplesMapPlan =
+    let private createTriplesMapPlan 
+            (index: int) 
+            (triplesMap: TriplesMap) 
+            (poolScope: PoolContextScope) 
+            (config: PlannerConfig) : TriplesMapPlan =
         let iteratorPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
         let iteratorPathId = poolScope.InternString(iteratorPath, StringAccessPattern.Planning)
         
@@ -766,7 +790,7 @@ module Planner =
             |> Array.mapi (fun i plan -> { plan with Dependencies = dependencies.[i] })
         
         // Phase 6: Dependency grouping and lazy index creation
-        let dependencyGroups = groupByDependenciesTailRec finalPlans
+        let dependencyGroups = groupByDependencies finalPlans
         
         // Lazy evaluation based on memory mode
         let lazyPredicateIndex = lazy (
@@ -782,7 +806,7 @@ module Planner =
         )
         
         let lazyPathToMaps = lazy pathToMapsEager
-        let lazyOverlapData = lazy (detectOverlapsTailRec finalPlans)
+        let lazyOverlapData = lazy (detectOverlaps finalPlans)
         
         {
             OrderedMaps = finalPlans
