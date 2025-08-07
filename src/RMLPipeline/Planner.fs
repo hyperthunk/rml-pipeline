@@ -235,18 +235,15 @@ module Planner =
         member this.GetString(stringId: StringId) : string voption =
             planningContext.GetString(stringId)
         
-        (* [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-        member inline this.TryGetString(stringId: StringId) : string option =
+        member this.TryGetString(stringId: StringId) : string option =
             match planningContext.GetString(stringId) with
             | ValueSome str -> Some str
             | ValueNone -> None 
         
-        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-        member inline this.GetStringUnsafe(stringId: StringId) : string =
+        member this.GetStringUnsafe(stringId: StringId) : string =
             match planningContext.GetString(stringId) with
             | ValueSome str -> str
-            | ValueNone -> failwith $"StringId {stringId.Value} not found in planning context"
-            *)
+            | ValueNone -> failwith $"StringId {stringId.Value} not found in planning context"        
 
     /// <summary>
     /// The execution plan for a single triples map, containing all the 
@@ -512,7 +509,10 @@ module Planner =
                             let id = poolScope.InternString(template, StringAccessPattern.Planning)
                             template, id, TupleFlags.IsConstant ||| TupleFlags.IsBlankNode
                     
-                    let hash = hashStringIds subjectTemplateId predicateId
+                    let hash = uint64 subjectTemplateId.Value ^^^ 
+                                (uint64 predicateId.Value <<< 1) ^^^ 
+                                (uint64 objId.Value <<< 2) ^^^  // or objTemplateId.Value
+                                (uint64 iteratorPathId.Value <<< 3)
                     
                     tuples.Add({
                         SubjectTemplateId = subjectTemplateId
@@ -555,7 +555,10 @@ module Planner =
                         (if objMap.Datatype.IsSome then TupleFlags.HasDatatype else TupleFlags.None) |||
                         (if objMap.Language.IsSome then TupleFlags.HasLanguage else TupleFlags.None)
                     
-                    let hash = hashStringIds subjectTemplateId predicateId
+                    let hash = uint64 subjectTemplateId.Value ^^^ 
+                                (uint64 predicateId.Value <<< 1) ^^^ 
+                                (uint64 objTemplateId.Value <<< 2) ^^^  // or objTemplateId.Value
+                                (uint64 iteratorPathId.Value <<< 3)
                     
                     tuples.Add({
                         SubjectTemplateId = subjectTemplateId
@@ -595,7 +598,14 @@ module Planner =
                             let parentTupleWithJoin = { parentTuple with Flags = parentTuple.Flags ||| TupleFlags.HasJoin }
                             let childTupleWithJoin = { childTuple with Flags = childTuple.Flags ||| TupleFlags.HasJoin }
                             
-                            let hash = parentTuple.Hash ^^^ (childTuple.Hash <<< 1)
+                            let hash = uint64 parentTuple.SubjectTemplateId.Value ^^^
+                                        (uint64 parentTuple.PredicateValueId.Value <<< 1) ^^^
+                                        (uint64 parentTuple.ObjectTemplateId.Value <<< 2) ^^^
+                                        (uint64 childTuple.SubjectTemplateId.Value <<< 3) ^^^
+                                        (uint64 childTuple.PredicateValueId.Value <<< 4) ^^^
+                                        (uint64 childTuple.ObjectTemplateId.Value <<< 5) ^^^
+                                        (uint64 parentPathId.Value <<< 6) ^^^
+                                        (uint64 childPathId.Value <<< 7)
                             
                             joinTuples.Add({
                                 ParentTuple = parentTupleWithJoin
@@ -788,21 +798,20 @@ module Planner =
         let stack = HotPathStack.Create(stackSize)
         
         // Direct access to StringPool hierarchy for read-only string resolution
-        let stringPool = plan.StringPoolHierarchy
-        let planningContext = plan.PlanningContext
+        (* let stringPool = plan.StringPoolHierarchy
+        let planningContext = plan.PlanningContext *)
         
-        // Tail-call optimized recursive processing functions
         let rec processGroups groupIndex =
             if groupIndex < plan.DependencyGroups.GroupStarts.Length then
                 let groupMembers = plan.DependencyGroups.GetGroup(groupIndex)
                 processMaps groupMembers 0
-                processGroups (groupIndex + 1) // Tail call to next group
+                processGroups (groupIndex + 1)
         
         and processMaps (groupMembers: int[]) mapIndex =
             if mapIndex < groupMembers.Length then
                 let mapPlan = plan.OrderedMaps.[groupMembers.[mapIndex]]
                 processTuples mapPlan.PredicateTuples 0
-                processMaps groupMembers (mapIndex + 1) // Tail call to next map
+                processMaps groupMembers (mapIndex + 1)
         
         and processTuples (tuples: PredicateTuple[]) tupleIndex =
             if tupleIndex < tuples.Length then
@@ -816,10 +825,15 @@ module Planner =
                     Flags = tuple.Flags
                 }
                 processHotPathTuple hotTuple
-                processTuples tuples (tupleIndex + 1) // Tail call to next tuple
+                processTuples tuples (tupleIndex + 1)
         
         and processHotPathTuple (tuple: HotPathTuple) =
-            // Stack operations on mutable stack
+            (* 
+                Stack operations on mutable stack - we previously did this 
+                with stackalloc<byte>, however the interop made for enough pain
+                that the shift to BitConverter and small performance hit is paid
+                for by simpler debugging and cross-platform compatibility. 
+            *)
             stack.Push tuple.Hash
             
             if tuple.Flags &&& TupleFlags.IsConstant <> TupleFlags.None then
@@ -830,33 +844,30 @@ module Planner =
                 stack.Push(uint64 tuple.SubjectTemplateId.Value)
                 stack.Push(uint64 tuple.PredicateValueId.Value)
                 stack.Push(uint64 tuple.ObjectTemplateId.Value)
+                stack.Push(uint64 tuple.SourcePathId.Value)  // ADD THIS LINE!
                 
                 let hasJoin = tuple.Flags &&& TupleFlags.HasJoin <> TupleFlags.None
                 if hasJoin then
-                    // Join processing with validation
-                    stack.Push(uint64 tuple.SourcePathId.Value)
                     let sourceHash = stack.Pop()
                     let objectHash = stack.Pop()
                     let predicateHash = stack.Pop()
                     let subjectHash = stack.Pop()
                     let originalHash = stack.Pop()
                     
-                    // Compute combined hash for join validation
-                    let computedHash = subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
-                    
-                    // Validate join integrity (result ignored for now, could be used for error handling)
+                    let computedHash = 
+                        subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
                     ignore (computedHash = originalHash)
                 else
                     // Validation pathway
+                    let sourceHash = stack.Pop()
                     let objectHash = stack.Pop()
                     let predicateHash = stack.Pop()
                     let subjectHash = stack.Pop()
                     let originalHash = stack.Pop()
                     
-                    // Compute hash for validation
-                    let computedHash = subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2)
+                    let computedHash = 
+                        subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
                     
-                    // TODO: Validate tuple integrity
                     ignore (computedHash = originalHash)
         
         // TCO
@@ -875,7 +886,7 @@ module Planner =
         let stack = HotPathStack.Create(stackSize)
         
         // Create string resolver for debugging
-        // let stringResolver = HotPathStringResolver(plan.PlanningContext)
+        let stringResolver = HotPathStringResolver(plan.PlanningContext)
         let mutable processedTuples = 0
         
         let rec processGroups groupIndex =
@@ -891,10 +902,10 @@ module Planner =
             if mapIndex < groupMembers.Length then
                 let mapPlan = plan.OrderedMaps.[groupMembers.[mapIndex]]
                 
-                (* if enableLogging then
+                if enableLogging then
                     let iteratorPath = stringResolver.TryGetString(mapPlan.IteratorPathId)
                     printfn "  [Map %d] Processing %d tuples (path: %A)" 
-                            mapPlan.Index mapPlan.PredicateTuples.Length iteratorPath *)
+                            mapPlan.Index mapPlan.PredicateTuples.Length iteratorPath
                 
                 processTuples mapPlan.PredicateTuples 0
                 processMaps groupMembers (mapIndex + 1)
@@ -918,12 +929,12 @@ module Planner =
         and processHotPathTuple (tuple: HotPathTuple) =
             stack.Push(tuple.Hash)
             
-            (* if enableLogging && processedTuples % 1000 = 0 then
+            if enableLogging && processedTuples % 1000 = 0 then
                 let subject = stringResolver.TryGetString(tuple.SubjectTemplateId)
                 let predicate = stringResolver.TryGetString(tuple.PredicateValueId)
                 let object = stringResolver.TryGetString(tuple.ObjectTemplateId)
                 printfn "    [Tuple %d] %A -> %A -> %A (flags: %A)" 
-                        processedTuples subject predicate object tuple.Flags *)
+                        processedTuples subject predicate object tuple.Flags
             
             if tuple.Flags &&& TupleFlags.IsConstant <> TupleFlags.None then
                 stack.Pop() |> ignore
@@ -931,6 +942,7 @@ module Planner =
                 stack.Push(uint64 tuple.SubjectTemplateId.Value)
                 stack.Push(uint64 tuple.PredicateValueId.Value)
                 stack.Push(uint64 tuple.ObjectTemplateId.Value)
+                stack.Push(uint64 tuple.SourcePathId.Value)
                 
                 let hasJoin = tuple.Flags &&& TupleFlags.HasJoin <> TupleFlags.None
                 if hasJoin then
@@ -948,12 +960,14 @@ module Planner =
                     
                     ignore (computedHash = originalHash)
                 else
+                    let sourceHash = stack.Pop()
                     let objectHash = stack.Pop()
                     let predicateHash = stack.Pop()
                     let subjectHash = stack.Pop()
                     let originalHash = stack.Pop()
                     
-                    let computedHash = subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2)
+                    let computedHash = 
+                        subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
                     
                     if enableLogging && computedHash <> originalHash then
                         printfn "    [WARNING] Tuple hash mismatch: computed=%d, original=%d" computedHash originalHash
