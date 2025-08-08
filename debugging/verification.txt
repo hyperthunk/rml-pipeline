@@ -729,3 +729,25 @@ The current fixed-array approach **will not scale** to enterprise RML workloads.
 The segmented array approach provides the best balance of simplicity, performance, and scalability. It maintains your lock-free design while eliminating the overflow problem that would plague large-scale deployments.
 
 **Key Insight**: Don't optimize for the worst case with pre-allocation. Instead, optimize for the common case with efficient growth strategies for scaling up when needed.
+
+I agree with your findings. We need to create a way to dynamically resize the available space, and chunking is a good approach!
+
+Firstly, I think there is a hybrid of pre-sizing appropriately and providing dynamic re-sizing. For example, in the worst case of 1k json documents, ~216 MB is not a problematic pre-allocation at all. Modern java applications often allocate 1 GB of perm-gen for server applications, after all. Indeed even the 400MB figure is not terrible, though it does raise the point that if we need to pre-allocate almost half a gigabyte of memory just for string handling, we will need a resource rich runtime environment to support our whole application.
+
+I would like to replace the static `IdAllocation` with a configuration that can be passed when starting up a pool. This should allow us to specify some baseline sizing rules for a given use-case, such that we might get a comfortable 200k sizing initially if we know the size of the mappings is large or expect the data to be big...
+
+Equally, once we have executed the planner, we can then reconfigure the pool hierarchy based on the complexity of the groups and dependencies we have found.
+
+Finally, we can set up disposable batch-scoped pools if needed. All these features should combine input configuration with analysis of the RML workload complexity - lots of complex mappings indicate we can expect fairly diverse input data, whilst a relatively simple RML workload can give some indicative measure of the divergence of data we might expect to see.
+
+I also agree that we need to implement a segmented string pool and generational tracking. 
+
+I have some concerns about your proposed implementation though. I do not want to re-introduce `ConcurrentDictionary` into our architecture, and the interning code runs on an extremely hot path, therefore continually checking if something needs promotion is an unnecessary performance hog if we need to keep checking the `AccessCounts`, will it not?
+
+What other choices might we have for dealing with access counts? Let's remember that our `StringIds` are constantly going to be growing across tiers, since they initializes at `poolBase + (groupId * rangeSize)` and then is incremented. Instead of tracking how frequently individual strings are accessed - which is expensive and might re-introduce the convoy effect in the face of massive concurrency - why don't we stripe the ids into a reasonable set of ranges and keep track of how frequently strings within the range are accessed? We might do this via `Interlocked.Increment`, although defining a suitable datatype structure to support that might be difficult.
+
+Alternatively we could eschew thread-safety when it comes to counting hot ids and use an unguarded `FastMap`. Obviously this leaves room for data inconsistencies, however does that really matter here - if we lose an increment or two or gain a few too many at one time, is that really going to alter the broader heuristic that growth in a segment means that strings in that segment probably need to be promoted?
+
+I am also unsure about the proposed design of the `SegmentedStringPool`. Won't the use of `ResizeArray` ruin cache dynamics where currently they are nicely handled across tiers? OR are you suggesting that we keep the baseline (pre-allocated, but now based on input config) arrays with whatever start size they're given, then for runtime arrays, fall back to the generational pool? My concern is optimising access times and data locality as much as possible.
+
+I am also concerned about the locking strategy for resizing. If we `lock this.Segments (fun () - etc)` then what are the thread safety implications? This feels worse than the somewhat esoteric starvation issue we found in `ConcurrentDictionary`, unless we are very careful about where access can occur. If there is just one generational pool that is shared, then perhaps that might be alright, but due to the hierarchical nature of the pooling strategy (and its index based lookup semantics) I am not sure that really holds up to scrutiny - I suspect we need to be able to grow the arrays in group and global pools also (local pools it's largely irrelevant, as we are single threaded and can grow the array on-demand!).
