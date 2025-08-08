@@ -71,7 +71,7 @@ module Planner =
     open RMLPipeline
     open RMLPipeline.FastMap.Types
     open RMLPipeline.Model
-    open RMLPipeline.Internal
+    open RMLPipeline.Internal.StringInterning
 
     /// <summary>
     /// Memory modes for the planner, allowing adaptive behavior based on 
@@ -193,7 +193,8 @@ module Planner =
             else
                 let startIdx = this.GroupStarts.[groupIndex]
                 let endIdx = 
-                    if groupIndex = this.GroupStarts.Length - 1 then this.GroupMembers.Length
+                    if groupIndex = this.GroupStarts.Length - 1 then 
+                         this.GroupMembers.Length
                     else this.GroupStarts.[groupIndex + 1]
                 this.GroupMembers.[startIdx..endIdx-1]
 
@@ -232,18 +233,13 @@ module Planner =
     type HotPathStringResolver(planningContext: PoolContextScope) =
         
         [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-        member this.GetString(stringId: StringId) : string voption =
+        member __.GetString(stringId: StringId) : string option =
             planningContext.GetString(stringId)
-        
-        member this.TryGetString(stringId: StringId) : string option =
-            match planningContext.GetString(stringId) with
-            | ValueSome str -> Some str
-            | ValueNone -> None 
-        
-        member this.GetStringUnsafe(stringId: StringId) : string =
-            match planningContext.GetString(stringId) with
-            | ValueSome str -> str
-            | ValueNone -> failwith $"StringId {stringId.Value} not found in planning context"        
+                
+        member __.GetStringUnsafe(stringId: StringId) : string =
+            match planningContext.GetString stringId with
+            | Some str -> str
+            | None -> failwith $"StringId {stringId.Value} not found in planning context"
 
     /// <summary>
     /// The execution plan for a single triples map, containing all the 
@@ -262,6 +258,10 @@ module Planner =
         IndexStrategy: IndexStrategy
     }
 
+    /// <summary>
+    /// The complete RML planning context, encapsulating all triples maps,
+    /// dependency groups, and string pool hierarchy.
+    /// </summary>
     type RMLPlan = {
         OrderedMaps: TriplesMapPlan[]
         DependencyGroups: DependencyGroups
@@ -284,21 +284,18 @@ module Planner =
         Hashes a string using the FNV-1a algorithm, since it is 
         fast, minimizes collisions, and is highly suitable for
         inlining to a single instruction across common architectures. 
+
+        NB: refactoring
     *)    
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    (* 
     let private hashString (str: string) : uint64 =
         let mutable hash = 14695981039346656037UL
         for i = 0 to str.Length - 1 do
             hash <- hash ^^^ uint64 str.[i]
             hash <- hash * 1099511628211UL
-        hash
-    
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    let private hashStringIds (id1: StringId) (id2: StringId) : uint64 =
-        let hash1 = uint64 id1.Value
-        let hash2 = uint64 id2.Value
-        hash1 ^^^ (hash2 <<< 1)
-    
+        hash 
+    *)
+
     (* 
         Comprehensively collects all string values that will be used 
         during planning and execution, including iterator paths, 
@@ -312,11 +309,11 @@ module Planner =
                 strings.Add(str)
         
         for triplesMap in triplesMaps do
-            // Collect iterator paths
+            // iterator paths
             triplesMap.LogicalSource.SourceIterator 
             |> Option.iter addStringIfNotEmpty
             
-            // Collect subject templates
+            // subject templates
             match triplesMap.SubjectMap with
             | Some sm -> 
                 match sm.SubjectTermMap.ExpressionMap.Template with
@@ -328,13 +325,13 @@ module Planner =
                     | Some (BlankNode bn) -> addStringIfNotEmpty ("_:" + bn)
                     | None -> ()
                     
-                // Collect subject reference patterns
+                // subject reference patterns
                 sm.SubjectTermMap.ExpressionMap.Reference
                 |> Option.iter (fun ref -> addStringIfNotEmpty ("{" + ref + "}"))
             | None -> 
                 triplesMap.Subject |> Option.iter addStringIfNotEmpty
             
-            // Collect all predicate-object mappings
+            // predicate-object maps
             for pom in triplesMap.PredicateObjectMap do
                 // Static predicates
                 for predicate in pom.Predicate do
@@ -432,7 +429,10 @@ module Planner =
         }
     
     let private detectOverlaps (plans: TriplesMapPlan[]) : struct (int * int * float)[] =
-        let rec calculateOverlaps (i: int) (j: int) (acc: struct (int * int * float) list) =
+        let rec calculateOverlaps 
+                (i: int) 
+                (j: int) 
+                (acc: struct (int * int * float) list) =
             if i >= plans.Length then acc |> List.rev |> List.toArray
             elif j >= plans.Length then calculateOverlaps (i + 1) (i + 2) acc
             elif i = j then calculateOverlaps i (j + 1) acc
@@ -447,7 +447,7 @@ module Planner =
                 
                 let predicateOverlap = 
                     let commonHashes = 
-                        plan1.PredicateTuples 
+                        plan1.PredicateTuples
                         |> Array.map (_.Hash)
                         |> Set.ofArray
                         |> Set.intersect (plan2.PredicateTuples |> Array.map _.Hash |> Set.ofArray)
@@ -466,7 +466,9 @@ module Planner =
         
         calculateOverlaps 0 1 []
     
-    let private chooseIndexStrategy (plan: TriplesMapPlan) (config: PlannerConfig) : IndexStrategy =
+    let private chooseIndexStrategy 
+            (plan: TriplesMapPlan) 
+            (config: PlannerConfig) : IndexStrategy =
         match config.IndexStrategy with
         | Some strategy -> strategy
         | None ->
@@ -476,10 +478,13 @@ module Planner =
             | complexity, deps, _ when complexity < 200 && deps < 3 -> HashIndex
             | _ -> FullIndex
     
-    let private extractPredicateTuples (triplesMap: TriplesMap) (mapIndex: int) (poolScope: PoolContextScope) : PredicateTuple[] =
-        let tuples = ResizeArray<PredicateTuple>()
+    let private extractPredicateTuples 
+            (triplesMap: TriplesMap) 
+            (mapIndex: int) 
+            (poolScope: PoolContextScope) : PredicateTuple[] =
         
-        let iteratorPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
+        let tuples         = ResizeArray<PredicateTuple>()        
+        let iteratorPath   = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
         let iteratorPathId = poolScope.InternString(iteratorPath, StringAccessPattern.Planning)
         
         let _, subjectTemplateId = 
@@ -533,11 +538,11 @@ module Planner =
                     
                     tuples.Add({
                         SubjectTemplateId = subjectTemplateId
-                        PredicateValueId = predicateId
-                        ObjectTemplateId = objId
-                        SourcePathId = iteratorPathId
-                        Hash = hash
-                        Flags = flags
+                        PredicateValueId  = predicateId
+                        ObjectTemplateId  = objId
+                        SourcePathId      = iteratorPathId
+                        Hash              = hash
+                        Flags             = flags
                     })
                 
                 // Process static predicates with object templates
@@ -545,28 +550,28 @@ module Planner =
                     let _, objTemplateId, flags = 
                         match objMap.ObjectTermMap.ExpressionMap.Template with
                         | Some template -> 
-                            let id = poolScope.InternString(template, StringAccessPattern.Planning)
+                            let id = poolScope.InternPlanningString template
                             template, id, TupleFlags.IsTemplate
                         | None ->
                             match objMap.ObjectTermMap.ExpressionMap.Reference with
                             | Some reference -> 
                                 let template = "{" + reference + "}"
-                                let id = poolScope.InternString(template, StringAccessPattern.Planning)
+                                let id = poolScope.InternPlanningString template
                                 template, id, TupleFlags.IsTemplate
                             | None ->
                                 match objMap.ObjectTermMap.ExpressionMap.Constant with
                                 | Some (URI uri) -> 
-                                    let id = poolScope.InternString(uri, StringAccessPattern.Planning)
+                                    let id = poolScope.InternPlanningString uri
                                     uri, id, TupleFlags.IsConstant
                                 | Some (Literal lit) -> 
-                                    let id = poolScope.InternString(lit, StringAccessPattern.Planning)
+                                    let id = poolScope.InternPlanningString lit
                                     lit, id, TupleFlags.IsConstant
                                 | Some (BlankNode bn) -> 
                                     let template = "_:" + bn
-                                    let id = poolScope.InternString(template, StringAccessPattern.Planning)
+                                    let id = poolScope.InternPlanningString template
                                     template, id, TupleFlags.IsConstant ||| TupleFlags.IsBlankNode
-                                | None -> "", poolScope.InternString("", StringAccessPattern.Planning), TupleFlags.None
-                    
+                                | None -> "", poolScope.InternPlanningString "", TupleFlags.None
+
                     let finalFlags = 
                         flags |||
                         (if objMap.Datatype.IsSome then TupleFlags.HasDatatype else TupleFlags.None) |||
@@ -579,11 +584,11 @@ module Planner =
                     
                     tuples.Add({
                         SubjectTemplateId = subjectTemplateId
-                        PredicateValueId = predicateId
-                        ObjectTemplateId = objTemplateId
-                        SourcePathId = iteratorPathId
-                        Hash = hash
-                        Flags = finalFlags
+                        PredicateValueId  = predicateId
+                        ObjectTemplateId  = objTemplateId
+                        SourcePathId      = iteratorPathId
+                        Hash              = hash
+                        Flags             = finalFlags
                     })
         
         tuples.ToArray()
@@ -603,37 +608,43 @@ module Planner =
                     |> Array.findIndex (fun tm -> Object.ReferenceEquals(tm, parentMap))
                 
                 let parentTuples = extractPredicateTuples parentMap parentIndex poolScope
-                let childTuples = extractPredicateTuples triplesMap mapIndex poolScope
+                let childTuples  = extractPredicateTuples triplesMap mapIndex poolScope
                 
                 for join in refObjMap.JoinCondition do
-                    let parentPath = parentMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
-                    let childPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
-                    
+                    let parentPath   = parentMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
+                    let childPath    = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"                    
                     let parentPathId = poolScope.InternString(parentPath, StringAccessPattern.Planning)
-                    let childPathId = poolScope.InternString(childPath, StringAccessPattern.Planning)
+                    let childPathId  = poolScope.InternString(childPath, StringAccessPattern.Planning)
 
                     for parentTuple in parentTuples do
                         for childTuple in childTuples do
                             // Mark both tuples as having joins
-                            let parentTupleWithJoin = { parentTuple with Flags = parentTuple.Flags ||| TupleFlags.HasJoin }
-                            let childTupleWithJoin = { childTuple with Flags = childTuple.Flags ||| TupleFlags.HasJoin }
-                            
-                            let hash = uint64 parentTuple.SubjectTemplateId.Value ^^^
-                                        (uint64 parentTuple.PredicateValueId.Value <<< 1) ^^^
-                                        (uint64 parentTuple.ObjectTemplateId.Value <<< 2) ^^^
-                                        (uint64 childTuple.SubjectTemplateId.Value <<< 3) ^^^
-                                        (uint64 childTuple.PredicateValueId.Value <<< 4) ^^^
-                                        (uint64 childTuple.ObjectTemplateId.Value <<< 5) ^^^
-                                        (uint64 parentPathId.Value <<< 6) ^^^
-                                        (uint64 childPathId.Value <<< 7)
+                            let parentTupleWithJoin = 
+                                { parentTuple with 
+                                    Flags = parentTuple.Flags ||| TupleFlags.HasJoin
+                                }
+                            let childTupleWithJoin = 
+                                { childTuple with 
+                                    Flags = childTuple.Flags ||| TupleFlags.HasJoin
+                                }
+
+                            let hash =  
+                                uint64 parentTuple.SubjectTemplateId.Value ^^^
+                                    (uint64 parentTuple.PredicateValueId.Value <<< 1) ^^^
+                                    (uint64 parentTuple.ObjectTemplateId.Value <<< 2) ^^^
+                                    (uint64 childTuple.SubjectTemplateId.Value <<< 3) ^^^
+                                    (uint64 childTuple.PredicateValueId.Value <<< 4) ^^^
+                                    (uint64 childTuple.ObjectTemplateId.Value <<< 5) ^^^
+                                    (uint64 parentPathId.Value <<< 6) ^^^
+                                    (uint64 childPathId.Value <<< 7)
                             
                             joinTuples.Add({
-                                ParentTuple = parentTupleWithJoin
-                                ChildTuple = childTupleWithJoin
-                                JoinCondition = join
-                                ParentPathId = parentPathId
-                                ChildPathId = childPathId
-                                Hash = hash
+                                ParentTuple    = parentTupleWithJoin
+                                ChildTuple     = childTupleWithJoin
+                                JoinCondition  = join
+                                ParentPathId   = parentPathId
+                                ChildPathId    = childPathId
+                                Hash           = hash
                             })
         
         joinTuples.ToArray()
@@ -665,7 +676,7 @@ module Planner =
             (triplesMap: TriplesMap) 
             (poolScope: PoolContextScope) 
             (config: PlannerConfig) : TriplesMapPlan =
-        let iteratorPath = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
+        let iteratorPath   = triplesMap.LogicalSource.SourceIterator |> Option.defaultValue "$"
         let iteratorPathId = poolScope.InternString(iteratorPath, StringAccessPattern.Planning)
         
         let pathSegments = 
@@ -674,26 +685,23 @@ module Planner =
                 poolScope.InternString(segment, StringAccessPattern.Planning))
         
         let predicateTuples = extractPredicateTuples triplesMap index poolScope
-        let complexity = calculateComplexity triplesMap
+        let complexity      = calculateComplexity triplesMap
         
         let plan = {
-            OriginalMap = triplesMap
-            Index = index
-            IteratorPathId = iteratorPathId
-            PathSegments = pathSegments
-            Dependencies = [||] // Will be computed later
-            Priority = 0
-            PredicateTuples = predicateTuples
-            JoinTuples = [||] // Will be computed later  
+            OriginalMap         = triplesMap
+            Index               = index
+            IteratorPathId      = iteratorPathId
+            PathSegments        = pathSegments
+            Dependencies        = [||]      // computed later
+            Priority            = 0
+            PredicateTuples     = predicateTuples
+            JoinTuples          = [||]      // computed later
             EstimatedComplexity = complexity
-            IndexStrategy = NoIndex // Will be set later
+            IndexStrategy       = NoIndex   // set later
         }
-        
-        { plan with IndexStrategy = chooseIndexStrategy plan config }
+        in { plan with IndexStrategy = chooseIndexStrategy plan config }
     
-    // ------------------------------------------------------------------------
-    // Lazy Index Construction
-    // ------------------------------------------------------------------------
+    (*  Lazy Index Construction *)
     
     let private buildPredicateIndex (plans: TriplesMapPlan[]) : FastMap<uint64, PredicateTuple[]> =
         // Only build indexes for plans that actually need them
@@ -737,14 +745,13 @@ module Planner =
         let planningStrings = 
             match config.MemoryMode with
             | LowMemory -> 
-                // Extract only essential strings to minimize memory
+                // Extract only essential strings to minimize space utilisation
                 triplesMaps
                 |> Array.collect (fun tm -> 
                     [|  yield tm.LogicalSource.SourceIterator |> Option.defaultValue "$"
                         yield! tm.PredicateObjectMap |> List.toArray |> Array.collect (fun pom -> pom.Predicate |> List.toArray) |])
                 |> Array.distinct
             | Balanced | HighPerformance ->
-                // Extract all template strings for full optimization
                 extractAllTemplateStrings triplesMaps
         
         // Phase 2: Create StringPool hierarchy
@@ -809,15 +816,15 @@ module Planner =
         let lazyOverlapData = lazy (detectOverlaps finalPlans)
         
         {
-            OrderedMaps = finalPlans
-            DependencyGroups = dependencyGroups
-            Config = config
+            OrderedMaps         = finalPlans
+            DependencyGroups    = dependencyGroups
+            Config              = config
             StringPoolHierarchy = stringPoolHierarchy
-            PlanningContext = planningContext
-            PredicateIndex = lazyPredicateIndex
-            JoinIndex = lazyJoinIndex
-            PathToMaps = lazyPathToMaps
-            OverlapData = lazyOverlapData
+            PlanningContext     = planningContext
+            PredicateIndex      = lazyPredicateIndex
+            JoinIndex           = lazyJoinIndex
+            PathToMaps          = lazyPathToMaps
+            OverlapData         = lazyOverlapData
         }
     
     let executeHotPath (plan: RMLPlan) : unit =
@@ -827,7 +834,7 @@ module Planner =
             | Balanced -> 8192
             | HighPerformance -> 16384
         
-        let stack = HotPathStack.Create(stackSize)
+        let stack = HotPathStack.Create stackSize
         
         let predicateIndex = 
             match plan.Config.IndexStrategy with
@@ -836,12 +843,14 @@ module Planner =
                 let index = plan.GetPredicateIndex()
                 if FastMap.isEmpty index then None else Some index
         
+        (* tail-call optimised using a fixed size stack *)
         let rec processGroups groupIndex =
             if groupIndex < plan.DependencyGroups.GroupStarts.Length then
                 let groupMembers = plan.DependencyGroups.GetGroup(groupIndex)
                 processMaps groupMembers 0
                 processGroups (groupIndex + 1)        
-        and processMaps (groupMembers: int[]) mapIndex =
+        and processMaps 
+                (groupMembers: int[]) mapIndex =
             if mapIndex < groupMembers.Length then
                 let mapPlan = plan.OrderedMaps.[groupMembers.[mapIndex]]                
                 match mapPlan.IndexStrategy, predicateIndex with
@@ -852,20 +861,24 @@ module Planner =
                 | (HashIndex | FullIndex), None -> 
                     processTuplesSequential mapPlan.PredicateTuples 0                
                 processMaps groupMembers (mapIndex + 1)        
-        and processTuplesSequential (tuples: PredicateTuple[]) tupleIndex =
+        and processTuplesSequential 
+                (tuples: PredicateTuple[]) tupleIndex =
             if tupleIndex < tuples.Length then
                 let tuple = tuples.[tupleIndex]
                 let hotTuple = {
-                    HotPathTuple.SubjectTemplateId = tuple.SubjectTemplateId
+                    HotPathTuple.SubjectTemplateId = 
+                        tuple.SubjectTemplateId
                     PredicateValueId = tuple.PredicateValueId
                     ObjectTemplateId = tuple.ObjectTemplateId
-                    SourcePathId = tuple.SourcePathId
-                    Hash = tuple.Hash
-                    Flags = tuple.Flags
+                    SourcePathId     = tuple.SourcePathId
+                    Hash             = tuple.Hash
+                    Flags            = tuple.Flags
                 }
                 processHotPathTuple hotTuple
                 processTuplesSequential tuples (tupleIndex + 1)        
-        and processTuplesIndexed (tuples: PredicateTuple[]) (index: FastMap<uint64, PredicateTuple[]>) =
+        and processTuplesIndexed 
+                (tuples: PredicateTuple[]) 
+                (index: FastMap<uint64, PredicateTuple[]>) =
             let processedHashes = ResizeArray<uint64>()
             
             for tuple in tuples do
@@ -876,22 +889,24 @@ module Planner =
                     | ValueSome relatedTuples ->
                         for relatedTuple in relatedTuples do
                             let hotTuple = {
-                                HotPathTuple.SubjectTemplateId = relatedTuple.SubjectTemplateId
+                                HotPathTuple.SubjectTemplateId = 
+                                    relatedTuple.SubjectTemplateId
                                 PredicateValueId = relatedTuple.PredicateValueId
                                 ObjectTemplateId = relatedTuple.ObjectTemplateId
-                                SourcePathId = relatedTuple.SourcePathId
-                                Hash = relatedTuple.Hash
-                                Flags = relatedTuple.Flags
+                                SourcePathId     = relatedTuple.SourcePathId
+                                Hash             = relatedTuple.Hash
+                                Flags            = relatedTuple.Flags
                             }
                             processHotPathTuple hotTuple
                     | ValueNone ->
                         let hotTuple = {
-                            HotPathTuple.SubjectTemplateId = tuple.SubjectTemplateId
+                            HotPathTuple.SubjectTemplateId = 
+                                tuple.SubjectTemplateId
                             PredicateValueId = tuple.PredicateValueId
                             ObjectTemplateId = tuple.ObjectTemplateId
-                            SourcePathId = tuple.SourcePathId
-                            Hash = tuple.Hash
-                            Flags = tuple.Flags
+                            SourcePathId     = tuple.SourcePathId
+                            Hash             = tuple.Hash
+                            Flags            = tuple.Flags
                         }
                         processHotPathTuple hotTuple        
         and processHotPathTuple (tuple: HotPathTuple) =
@@ -906,25 +921,30 @@ module Planner =
                 
                 let hasJoin = tuple.Flags &&& TupleFlags.HasJoin <> TupleFlags.None
                 if hasJoin then
-                    let sourceHash = stack.Pop()
-                    let objectHash = stack.Pop()
+                    let sourceHash    = stack.Pop()
+                    let objectHash    = stack.Pop()
                     let predicateHash = stack.Pop()
-                    let subjectHash = stack.Pop()
-                    let originalHash = stack.Pop()
-                    
+                    let subjectHash   = stack.Pop()
+                    let originalHash  = stack.Pop()
+
                     let computedHash = 
-                        subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
+                        subjectHash ^^^ (predicateHash <<< 1) 
+                                    ^^^ (objectHash <<< 2) 
+                                    ^^^ (sourceHash <<< 3)
                     ignore (computedHash = originalHash)
                 else
-                    let sourceHash = stack.Pop()
-                    let objectHash = stack.Pop()
+                    let sourceHash    = stack.Pop()
+                    let objectHash    = stack.Pop()
                     let predicateHash = stack.Pop()
-                    let subjectHash = stack.Pop()
-                    let originalHash = stack.Pop()
-                    
+                    let subjectHash   = stack.Pop()
+                    let originalHash  = stack.Pop()
+
                     let computedHash = 
-                        subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
-                    
+                        subjectHash ^^^ (predicateHash <<< 1) 
+                                    ^^^ (objectHash <<< 2) 
+                                    ^^^ (sourceHash <<< 3)
+
+                    // TODO: do we actually want to crash here or warn?
                     ignore (computedHash = originalHash)
         
         processGroups 0
@@ -959,7 +979,7 @@ module Planner =
                 let mapPlan = plan.OrderedMaps.[groupMembers.[mapIndex]]
                 
                 if enableLogging then
-                    let iteratorPath = stringResolver.TryGetString(mapPlan.IteratorPathId)
+                    let iteratorPath = stringResolver.GetString mapPlan.IteratorPathId
                     printfn "  [Map %d] Processing %d tuples (path: %A)" 
                             mapPlan.Index mapPlan.PredicateTuples.Length iteratorPath
                 
@@ -973,9 +993,9 @@ module Planner =
                     HotPathTuple.SubjectTemplateId = tuple.SubjectTemplateId
                     PredicateValueId = tuple.PredicateValueId
                     ObjectTemplateId = tuple.ObjectTemplateId
-                    SourcePathId = tuple.SourcePathId
-                    Hash = tuple.Hash
-                    Flags = tuple.Flags
+                    SourcePathId     = tuple.SourcePathId
+                    Hash             = tuple.Hash
+                    Flags            = tuple.Flags
                 }
                 
                 processHotPathTuple hotTuple
@@ -986,9 +1006,9 @@ module Planner =
             stack.Push(tuple.Hash)
             
             if enableLogging && processedTuples % 1000 = 0 then
-                let subject = stringResolver.TryGetString(tuple.SubjectTemplateId)
-                let predicate = stringResolver.TryGetString(tuple.PredicateValueId)
-                let object = stringResolver.TryGetString(tuple.ObjectTemplateId)
+                let subject   = stringResolver.GetString tuple.SubjectTemplateId
+                let predicate = stringResolver.GetString tuple.PredicateValueId
+                let object    = stringResolver.GetString tuple.ObjectTemplateId
                 printfn "    [Tuple %d] %A -> %A -> %A (flags: %A)" 
                         processedTuples subject predicate object tuple.Flags
             
@@ -1003,30 +1023,37 @@ module Planner =
                 let hasJoin = tuple.Flags &&& TupleFlags.HasJoin <> TupleFlags.None
                 if hasJoin then
                     stack.Push(uint64 tuple.SourcePathId.Value)
-                    let sourceHash = stack.Pop()
-                    let objectHash = stack.Pop()
+                    let sourceHash    = stack.Pop()
+                    let objectHash    = stack.Pop()
                     let predicateHash = stack.Pop()
-                    let subjectHash = stack.Pop()
-                    let originalHash = stack.Pop()
+                    let subjectHash   = stack.Pop()
+                    let originalHash  = stack.Pop()
                     
-                    let computedHash = subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
+                    let computedHash = 
+                        subjectHash ^^^ (predicateHash <<< 1) 
+                                    ^^^ (objectHash <<< 2) 
+                                    ^^^ (sourceHash <<< 3)
                     
                     if enableLogging && computedHash <> originalHash then
-                        printfn "    [WARNING] Join hash mismatch: computed=%d, original=%d" computedHash originalHash
+                        printfn "    [WARNING] Join hash mismatch: computed=%d, original=%d" 
+                            computedHash originalHash
                     
                     ignore (computedHash = originalHash)
                 else
-                    let sourceHash = stack.Pop()
-                    let objectHash = stack.Pop()
+                    let sourceHash    = stack.Pop()
+                    let objectHash    = stack.Pop()
                     let predicateHash = stack.Pop()
-                    let subjectHash = stack.Pop()
-                    let originalHash = stack.Pop()
+                    let subjectHash   = stack.Pop()
+                    let originalHash  = stack.Pop()
                     
                     let computedHash = 
-                        subjectHash ^^^ (predicateHash <<< 1) ^^^ (objectHash <<< 2) ^^^ (sourceHash <<< 3)
+                        subjectHash ^^^ (predicateHash <<< 1) 
+                                    ^^^ (objectHash <<< 2) 
+                                    ^^^ (sourceHash <<< 3)
                     
                     if enableLogging && computedHash <> originalHash then
-                        printfn "    [WARNING] Tuple hash mismatch: computed=%d, original=%d" computedHash originalHash
+                        printfn "    [WARNING] Tuple hash mismatch: computed=%d, original=%d" 
+                            computedHash originalHash
                     
                     ignore (computedHash = originalHash)
         
@@ -1076,9 +1103,7 @@ module Planner =
         
         // Get the actual string value from a StringId using the plan's context
         let getString (plan: RMLPlan) (stringId: StringId) : string option =
-            match plan.PlanningContext.GetString(stringId) with
-            | ValueSome str -> Some str
-            | ValueNone -> None
+            plan.PlanningContext.GetString stringId
         
         let getMemoryStats (plan: RMLPlan) : PoolStats =
             StringPool.getAggregateStats plan.StringPoolHierarchy

@@ -7,6 +7,7 @@ open RMLPipeline.Model
 open RMLPipeline.DSL
 open RMLPipeline.Internal
 open RMLPipeline.Internal.Planner
+open RMLPipeline.Internal.StringInterning
 open System
 
 module PlannerModelTests =
@@ -129,8 +130,7 @@ module PlannerModelTests =
             let hasValidStructure = 
                 plan.OrderedMaps.Length >= 0 &&
                 // Dependency groups length should match the presence of maps
-                (plan.OrderedMaps.Length = 0) = (plan.DependencyGroups.GroupStarts.Length = 0) &&
-                plan.StringPoolHierarchy <> Unchecked.defaultof<_>
+                (plan.OrderedMaps.Length = 0) = (plan.DependencyGroups.GroupStarts.Length = 0)
             
             let supportsBoundsChecking = 
                 plan.OrderedMaps.Length = 0 || 

@@ -11,7 +11,7 @@ open RMLPipeline
 open RMLPipeline.Core
 open RMLPipeline.Model
 open RMLPipeline.DSL
-open RMLPipeline.Internal
+open RMLPipeline.Internal.StringInterning
 
 (*
 AIMS
@@ -378,12 +378,12 @@ module StringPoolTests =
                             // Torn reads/writes: Partial updates to string storage arrays
                             // Index corruption: StringId pointing to wrong array location due to concurrent modifications
                             // Memory reordering: CPU/compiler reordering causing reads to see inconsistent state
-                            match scope.GetString(id1) with
-                            | ValueSome retrievedString 
+                            match scope.GetString id1 with
+                            | Some retrievedString 
                                 when retrievedString = stringToUse -> ()
-                            | ValueSome _ -> 
+                            | Some _ -> 
                                 Interlocked.Increment threadSafetyViolations |> ignore
-                            | ValueNone -> 
+                            | None -> 
                                 Interlocked.Increment threadSafetyViolations |> ignore
 
                             sw.Stop()
@@ -392,7 +392,7 @@ module StringPoolTests =
                             
                             // Add some variability in timing
                             if i % 10 = 0 then
-                                do! Async.Sleep(1)
+                                do! Async.Sleep 1
                         with
                         | ex -> 
                             Interlocked.Increment errors |> ignore
@@ -463,9 +463,9 @@ module StringPoolTests =
                 validStrings |> Array.forall (fun originalStr ->
                     try
                         let id = scope.InternString(originalStr)
-                        match scope.GetString(id) with
-                        | ValueSome retrievedStr -> retrievedStr = originalStr
-                        | ValueNone -> false
+                        match scope.GetString id with
+                        | Some retrievedStr -> retrievedStr = originalStr
+                        | None -> false
                     with
                     | _ -> false
                 )
@@ -495,8 +495,8 @@ module StringPoolTests =
                 let planningId = scope.InternString(str, StringAccessPattern.Planning)
                 
                 // Both should be retrievable and return the same string
-                match scope.GetString(highFreqId), scope.GetString(planningId) with
-                | ValueSome s1, ValueSome s2 -> s1 = str && s2 = str
+                match scope.GetString highFreqId, scope.GetString planningId with
+                | Some s1, Some s2 -> s1 = str && s2 = str
                 | _ -> false
             )
 
@@ -515,9 +515,9 @@ module StringPoolTests =
                     try
                         let id1 = scope1.InternString(str, StringAccessPattern.MediumFrequency)
                         let id2 = scope2.InternString(str, StringAccessPattern.MediumFrequency)
-                        
-                        match scope1.GetString(id1), scope2.GetString(id2) with
-                        | ValueSome s1, ValueSome s2 -> s1 = s2 && s1 = str
+
+                        match scope1.GetString id1, scope2.GetString id2 with
+                        | Some s1, Some s2 -> s1 = s2 && s1 = str
                         | _ -> false
                     with
                     | _ -> false
@@ -679,9 +679,9 @@ module StringPoolTests =
             // Test 1: Planning strings should be found immediately
             planningStrings |> Array.iter (fun str ->
                 let id = scope.InternString(str, StringAccessPattern.Planning)
-                match scope.GetString(id) with
-                | ValueSome retrievedStr -> Expect.equal retrievedStr str "Should retrieve planning string"
-                | ValueNone -> failtest "Should find planning string"
+                match scope.GetString id with
+                | Some retrievedStr -> Expect.equal retrievedStr str "Should retrieve planning string"
+                | None -> failtest "Should find planning string"
             )
             
             // Test 2: Planning strings should have low StringIds (indicating global pool)
@@ -715,8 +715,8 @@ module StringPoolTests =
             let overflowId = scope.InternString(overflowStr, StringAccessPattern.HighFrequency)
             
             match scope.GetString overflowId with
-            | ValueSome retrievedStr -> Expect.equal retrievedStr overflowStr "Should handle overflow correctly"
-            | ValueNone -> failtest "Should handle overflow string"
+            | Some retrievedStr -> Expect.equal retrievedStr overflowStr "Should handle overflow correctly"
+            | None -> failtest "Should handle overflow string"
 
         testCase "Memory usage tracking" <| fun _ ->
             let hierarchy = StringPool.create [||]
@@ -777,8 +777,8 @@ module StringPoolTests =
             extractedStrings |> List.iter (fun str ->
                 let id = scope.InternString(str, StringAccessPattern.Planning)
                 match scope.GetString(id) with
-                | ValueSome retrievedStr -> Expect.equal retrievedStr str "Should find extracted string"
-                | ValueNone -> failtest $"Should find extracted string: {str}"
+                | Some retrievedStr -> Expect.equal retrievedStr str "Should find extracted string"
+                | None -> failtest $"Should find extracted string: {str}"
             )
 
         testCase "Join condition string handling" <| fun _ ->
@@ -943,9 +943,9 @@ module StringPoolTests =
             use scope = StringPool.createScope hierarchy None None
             
             let invalidId = StringId -1
-            match scope.GetString(invalidId) with
-            | ValueSome _ -> failtest "Should not find string for invalid ID"
-            | ValueNone -> () // Expected
+            match scope.GetString invalidId with
+            | Some _ -> failtest "Should not find string for invalid ID"
+            | None -> () // Expected
 
         testCase "Single character string handling" <| fun _ ->
             let hierarchy = StringPool.create [||]
@@ -953,15 +953,15 @@ module StringPoolTests =
 
             // Single character string
             let singleCharId = scope.InternString("x")
-            match scope.GetString(singleCharId) with
-            | ValueSome str -> Expect.equal str "x" "Should handle single character string"
-            | ValueNone -> failtest "Should find single character string"
-            
+            match scope.GetString singleCharId with
+            | Some str -> Expect.equal str "x" "Should handle single character string"
+            | None -> failtest "Should find single character string"
+
             // Whitespace string
             let whitespaceId = scope.InternString("   ")
-            match scope.GetString(whitespaceId) with
-            | ValueSome str -> Expect.equal str "   " "Should handle whitespace string"
-            | ValueNone -> failtest "Should find whitespace string"
+            match scope.GetString whitespaceId with
+            | Some str -> Expect.equal str "   " "Should handle whitespace string"
+            | None -> failtest "Should find whitespace string"
 
         testCase "Large string handling" <| fun _ ->
             let hierarchy = StringPool.create [||]
@@ -969,10 +969,10 @@ module StringPoolTests =
             
             let largeString = String.replicate 10000 "large"
             let id = scope.InternString(largeString, StringAccessPattern.LowFrequency)
-            
-            match scope.GetString(id) with
-            | ValueSome retrievedStr -> Expect.equal retrievedStr largeString "Should handle large strings"
-            | ValueNone -> failtest "Should find large string"
+
+            match scope.GetString id with
+            | Some retrievedStr -> Expect.equal retrievedStr largeString "Should handle large strings"
+            | None -> failtest "Should find large string"
 
         testCase "Unicode and special character handling" <| fun _ ->
             let hierarchy = StringPool.create [||]
@@ -989,9 +989,9 @@ module StringPoolTests =
             
             unicodeStrings |> Array.iter (fun str ->
                 let id = scope.InternString(str)
-                match scope.GetString(id) with
-                | ValueSome retrievedStr -> Expect.equal retrievedStr str $"Should handle unicode string: {str}"
-                | ValueNone -> failtest $"Should find unicode string: {str}"
+                match scope.GetString id with
+                | Some retrievedStr -> Expect.equal retrievedStr str $"Should handle unicode string: {str}"
+                | None -> failtest $"Should find unicode string: {str}"
             )
 
         testCase "Context disposal cleanup" <| fun _ ->
@@ -1009,10 +1009,10 @@ module StringPoolTests =
             use finalScope = StringPool.createScope hierarchy None None
             let finalStr = "final_test_string"
             let finalId = finalScope.InternString(finalStr)
-            
-            match finalScope.GetString(finalId) with
-            | ValueSome retrievedStr -> Expect.equal retrievedStr finalStr "Should work after context disposals"
-            | ValueNone -> failtest "Should find string after context disposals"
+
+            match finalScope.GetString finalId with
+            | Some retrievedStr -> Expect.equal retrievedStr finalStr "Should work after context disposals"
+            | None -> failtest "Should find string after context disposals"
     ]
 
     let modelBasedTests = [
@@ -1062,10 +1062,10 @@ module StringPoolTests =
                 results <- (str, pattern, id) :: results
                 
                 // Verify round-trip always works
-                match scope.GetString(id) with
-                | ValueSome retrievedStr -> Expect.equal retrievedStr str "Round-trip should work"
-                | ValueNone -> failtest "Should retrieve interned string"
-            
+                match scope.GetString id with
+                | Some retrievedStr -> Expect.equal retrievedStr str "Round-trip should work"
+                | None -> failtest "Should retrieve interned string"
+
             // Verify same string + same pattern = same ID
             let highFreqIds = results |> List.filter (fun (s, p, _) -> s = "string1" && p = StringAccessPattern.HighFrequency)
             Expect.equal (List.length highFreqIds) 2 "Should have two HighFrequency entries for string1"
