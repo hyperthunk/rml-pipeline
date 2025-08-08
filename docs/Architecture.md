@@ -18,7 +18,7 @@ Whilst F# may not seem like that obvious choice - Rust would be a great fit for 
 
 The planning algorithm performs dependency analysis of the transitive closure of dependencies, placing maps with no dependencies into independent groups, and maps with shared dependencies into the same group. This is primarily an enabler for parallelism, since independent groups can run with no synchronization, whilst intra-group dependencies that require coordination, can still parallelize non-dependent maps.
 
-This also allows us to pre-computed our coordination requirements, since all synchronization points are known at planning time.
+This also allows us to pre-compute our coordination requirements, since all synchronization points are known at planning time.
 
 
 ### Design Decisions - Layering
