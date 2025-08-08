@@ -242,6 +242,7 @@ module StringInterning =
             // TODO: ConcurrentHashMap#Values is potentially a bit expensive, maybe use sampling instead?
             let runtimeMemory = 
                 this.RuntimeIdToString.Values
+                |> Seq.cache  // cache the enumerator to avoid contention
                 |> Seq.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2))
             
             // Calculate hit ratio for this pool
@@ -323,7 +324,7 @@ module StringInterning =
                     // Fetch from the appropriate tier
                     let result = 
                         if id.Value < IdAllocation.GroupPoolBase then
-                            this.GlobalPool.GetString(id)
+                            this.GlobalPool.GetString id
                         else
                             None  // Would be another group or local pool
                     
@@ -337,6 +338,7 @@ module StringInterning =
         member this.GetStats() : PoolStats = 
             let groupMemory = 
                 this.GroupIdToString.Values
+                    |> Seq.cache
                     |> Seq.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2))
             
             // Calculate hit ratio for this pool
@@ -407,14 +409,14 @@ module StringInterning =
 
             | StringAccessPattern.Planning ->
                 // Delegate to global pool for planning strings
-                this.GlobalPool.InternString(str)
+                this.GlobalPool.InternString str
             
             | _ ->
                 // Medium/Low frequency - use group pool if available
                 match this.GroupPool with
-                | Some pool -> pool.InternString(str)
-                | None -> this.GlobalPool.InternString(str)
-        
+                | Some pool -> pool.InternString str
+                | None -> this.GlobalPool.InternString str
+
         member this.GetString(id: StringId) : string option =
             // First check if it's in our local range
             if id.Value < 0 then 
