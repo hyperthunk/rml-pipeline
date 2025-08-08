@@ -36,7 +36,7 @@ LRU Management in LocalPool: The UpdateLRU and EvictLRU methods are not thread-s
 Critical Section in the Code
 The most problematic code path appears to be in LocalPool.InternString when it falls back to other tiers:
 
-F#
+```F#
 match pattern with
 | StringAccessPattern.HighFrequency ->
     // Local pool operations with LRU management
@@ -49,11 +49,14 @@ match pattern with
     match this.GroupPool with
     | Some pool -> pool.InternString str
     | None -> this.GlobalPool.InternString str
+```
+
 While each pool tier has its own locking strategy, the interaction between them can create circular wait conditions. For example:
 
 Thread A has a lock on Group Pool 1 and tries to access the Global Pool
 Thread B has a lock on the Global Pool and tries to access Group Pool 1
 Result: Deadlock
+
 Reproducing the Issue
 The test case that's most likely to trigger this issue is testCase "Concurrent access preserves string identity with complex mappings" because:
 
@@ -64,8 +67,10 @@ The deadlock is more likely to occur in parallel mode because:
 
 Multiple FsCheck test threads can be running different test cases simultaneously
 Each test case spawns its own worker threads
+
 This creates a much higher number of concurrent threads accessing the string pool
 Solution Recommendations
+
 Here are several approaches to fix the deadlock:
 
 1. Implement a Strict Lock Hierarchy
@@ -73,7 +78,8 @@ Ensure locks are always acquired in a consistent order:
 
 Global pool locks must be acquired before group pool locks
 Group pool locks must be acquired before local pool locks
-F#
+
+```F#
 // Example of a safe pattern for cross-tier lookups
 member this.SafeGetString(id: StringId) : string option =
     // Check global first
@@ -84,10 +90,12 @@ member this.SafeGetString(id: StringId) : string option =
         match this.GroupPool with
         | Some pool -> pool.TryGetString(id)
         | None -> None
+```
+
 2. Make Local Pool Operations Truly Lock-Free
 The LocalPool should be truly single-threaded, or it should use proper synchronization:
 
-F#
+```F#
 // Add proper synchronization to LRU operations
 member private this.UpdateLRU(str: string) : unit =
     lock this.lruLock (fun () ->
@@ -99,10 +107,12 @@ member private this.UpdateLRU(str: string) : unit =
             let node = this.AccessOrder.AddLast str
             this.StringToNode <- FastMap.add str node this.StringToNode
     )
+```
+
 3. Eliminate Cross-Tier Lookup Patterns
 Refactor the design to avoid having higher tiers lookup strings in lower tiers, which creates circular dependencies:
 
-F#
+```F#
 // Provide a clear one-way lookup pattern
 member this.GetString(id: StringId) : string option =
     // Determine ownership by ID range and only query the owner
@@ -124,10 +134,12 @@ member this.GetString(id: StringId) : string option =
             Some this.LocalArray.[localIndex]
         else
             None
+```
+
 4. Implement Deadlock Detection and Avoidance
 Add timeouts to lock acquisitions to avoid permanent deadlocks:
 
-F#
+```F#
 let tryAcquireLock (timeout: TimeSpan) =
     if not (lockObj.TryEnterReadLock(timeout)) then
         // Log the failure and use fallback strategy
@@ -138,12 +150,15 @@ let tryAcquireLock (timeout: TimeSpan) =
             Some result
         finally
             lockObj.ExitReadLock()
+```
+
 Most Pragmatic Solution
 The most immediate solution would be to implement a strict lock hierarchy, as this requires the least changes to the existing code while directly addressing the deadlock issue. I would recommend:
 
-Modify cross-tier lookups to always acquire locks in a consistent order (global → group → local)
-Implement proper synchronization for the LocalPool's LRU management
-Add deadlock detection via timeouts as a safety mechanism
+- Modify cross-tier lookups to always acquire locks in a consistent order (global → group → local)
+- Implement proper synchronization for the LocalPool's LRU management
+- Add deadlock detection via timeouts as a safety mechanism
+
 This approach preserves most of the current design while eliminating the deadlock condition, allowing your parallel tests to complete successfully.
 
 Additional Observations
@@ -155,7 +170,7 @@ This type of issue is notoriously difficult to catch without extensive stress te
 
 The deadlock is not due to a fundamental flaw in the architecture, but rather a coordination issue in how the tiers interact. With the suggested changes, the parallel operation should work reliably while preserving the performance benefits of the current design.
 
-Planner.fs
+Attached File: Planner.fs
 You said: Let's review these points one by one,
 Let's review these points one by one, so we can get to the bottom of this deadlock condition. We have to be mindful that this code is on an extremely hot path, which is heavily optimised to avoid excessive allocations. I am attaching the Planner code that uses the string pool for your reference, so you can understand why excessive locking is not something we can tolerate here.
 
@@ -175,20 +190,25 @@ The main points of potential contention in the group and global pools are indeed
 
 Please dive deep into this again, and see if you can uncover the real issue.
 Copilot said: # Advanced Analysis of StringPool Deadlock Issue After
+
 Advanced Analysis of StringPool Deadlock Issue
+
 After reviewing the code more carefully alongside the Planner.fs file and thread dumps, I've identified the likely cause of the deadlock. The issue is subtler than a simple circular lock dependency and appears to involve the internal mechanisms of ConcurrentDictionary under high contention.
 
 Root Cause: Dictionary Contention and Internal Lock Convoys
+
 The deadlock (or more accurately, thread starvation) happens because of how ConcurrentDictionary manages internal locks. When examining the thread dump, we see numerous threads blocked in synchronization primitives (JIT_MonEnterWorker_Portable, AwareLock::Enter() and __psynch_cvwait).
 
 The core issue:
 
 Internal Lock Striping: ConcurrentDictionary uses lock striping (multiple locks for different segments of the dictionary) to allow concurrent access
+
 Lock Convoy Formation: Under high contention with default initialization parameters, these locks can form "convoys" where threads queue up waiting for the same lock bucket
+
 Compound Operations: The string pool performs multiple dictionary operations in sequence, which aren't atomic as a group
 Here's the critical section in the GroupPool that's likely causing problems:
 
-F#
+```F#
 member this.InternString(str: string) : StringId =
     // First check in group strings
     match this.GroupStrings.TryGetValue str with
@@ -205,6 +225,8 @@ member this.InternString(str: string) : StringId =
                 let newId = StringId (this.GroupPoolBaseId + offset)
                 this.GroupIdToString.[newId.Value] <- s  // Second dictionary operation
                 newId)
+```
+
 The problem occurs when multiple threads:
 
 Try to intern the same or hash-colliding strings concurrently
@@ -213,10 +235,12 @@ End up contending for the same internal bucket locks in the ConcurrentDictionary
 Specific Issues with Dictionary Initialization
 Looking at the code, the dictionaries are created without specifying capacity or concurrency level:
 
-F#
+```F#
 GroupStrings = ConcurrentDictionary<string, StringId>()
 GroupIdToString = ConcurrentDictionary<int, string>()
 CrossTierCache = ConcurrentDictionary<StringId, string>()
+```
+
 This means:
 
 The dictionary starts small and resizes frequently under load
@@ -236,7 +260,8 @@ Solution Approach: Optimizing Dictionary Usage
 Here's a more specialized solution focusing on the ConcurrentDictionary usage:
 
 Initialize dictionaries with appropriate capacity and concurrency level:
-F#
+
+```F#
 // For high-concurrency scenarios
 let concurrencyLevel = Environment.ProcessorCount * 4  // Oversubscribe for better parallelism
 let initialCapacity = 1024  // Start with a reasonable size to avoid resizes
@@ -245,8 +270,11 @@ let initialCapacity = 1024  // Start with a reasonable size to avoid resizes
 GroupStrings = ConcurrentDictionary<string, StringId>(concurrencyLevel, initialCapacity)
 GroupIdToString = ConcurrentDictionary<int, string>(concurrencyLevel, initialCapacity)
 CrossTierCache = ConcurrentDictionary<StringId, string>(concurrencyLevel, initialCapacity)
+```
+
 Replace GetOrAdd with a more controlled two-step process:
-F#
+
+```F#
 member this.InternString(str: string) : StringId =
     match this.GroupStrings.TryGetValue str with
     | true, id -> id
@@ -273,8 +301,11 @@ member this.InternString(str: string) : StringId =
                 | false, _ -> 
                     // Very unlikely race condition - retry
                     this.InternString(str)
+```
+
 Add timeouts to prevent indefinite waiting:
-F#
+
+```F#
 // Add a helper method with timeout for critical operations
 let tryGetValueWithTimeout<'K, 'V> (dict: ConcurrentDictionary<'K, 'V>) (key: 'K) (timeout: TimeSpan) =
     let mutable value = Unchecked.defaultof<'V>
@@ -287,6 +318,8 @@ let tryGetValueWithTimeout<'K, 'V> (dict: ConcurrentDictionary<'K, 'V>) (key: 'K
         System.Threading.Thread.SpinWait(20)
     
     None
+```
+
 Separate the CrossTierCache by accessor thread:
 Instead of having a shared CrossTierCache in GroupPool, consider using thread-local caches or a sharded approach to reduce contention.
 
@@ -295,7 +328,7 @@ Pre-populate dictionaries during initialization for known common strings
 
 Implement back-off strategies when contention is detected:
 
-F#
+```F#
 // Example of exponential backoff
 let rec tryWithBackoff attempt maxAttempts =
     if attempt > maxAttempts then
@@ -310,6 +343,8 @@ let rec tryWithBackoff attempt maxAttempts =
         let backoffMs = Math.Min(100 * Math.Pow(2.0, float attempt), 1000.0)
         System.Threading.Thread.Sleep(int backoffMs)
         tryWithBackoff (attempt + 1) maxAttempts
+```
+
 Consider lock-free alternatives for parts of the implementation:
 
 For counters: AtomicLong or similar constructs
@@ -326,9 +361,9 @@ If still seeing issues, implement the two-step TryGet/TryAdd pattern to replace 
 Monitor contention metrics (if available) to confirm improvement
 The solution focuses on reducing contention rather than adding more locks, which aligns with your high-performance requirements while addressing the root cause of the deadlock.
 
-Pipeline.fs
-Streaming.fs
-You said: Since this contention only takes place when
+Attached: Pipeline.fs, Streaming.fs
+
+You said:
 Since this contention only takes place when we have a very high load of medium or low intensity strings being added, either to the global or (more likely) the group pools, could we work around this by moving to a MORE lock-free approach?
 
 Say we replace the concurrent dictionaries with pre-sized arrays, allowing for runtime 15k strings in the global pool, and 25-50k in the group - with those initial sizes based on the potentiality of concurrent access based on the configuration (are we in low memory mode, how many complex groups, etc)...
@@ -358,17 +393,18 @@ These will be split into two categories - the same values being frequently read 
 
 These are the highest frequency strings, wherein we will likely see huge repetition of constructed IRIs and other rdf constructs time and time again.
 
-I am attaching two old versions of the streaming pipeline - these use older string interning and planning code, so please only use them to form an approximate view of the kind of data pipeline we might be talking about.
-  
+I am attaching two old versions of the streaming pipeline - these use older string interning and planning code, so please only use them to form an approximate view of the kind of data pipeline we might be talking about.  
      
-Copilot said: # Analysis of Pre-allocated Array Approach for
+Copilot said: 
+
+# Analysis of Pre-allocated Array Approach for
 Analysis of Pre-allocated Array Approach for StringPool
 Based on the deadlock issues and your proposed pre-sized array solution, I've conducted a thorough analysis of the approach and its implications. This solution directly addresses the root cause we identified: contention in ConcurrentDictionary operations under high parallel load.
 
 Proposed Design
 Replace the concurrent dictionaries in GlobalPool and GroupPool with a lock-free array-based design:
 
-F#
+```F#
 type GroupPool = {
     // Existing fields...
     
@@ -378,11 +414,14 @@ type GroupPool = {
     mutable NextRuntimeIndex: int64          // Atomic counter for allocation
     OverflowStrings: ConcurrentDictionary<string, StringId>  // Fallback only
 }
+```
+
 The key mechanics:
 
-Pre-allocate fixed-size arrays based on memory mode
-Use Interlocked.Increment to atomically obtain the next available slot
-Fall back to dictionary with timeout only when arrays are full
+- Pre-allocate fixed-size arrays based on memory mode
+- Use Interlocked.Increment to atomically obtain the next available slot
+- Fall back to dictionary with timeout only when arrays are full
+
 CPU Instruction Analysis
 Interlocked Operations vs Lock-Based Approach
 Operation	Interlocked.Increment	ConcurrentDictionary Access
@@ -390,31 +429,38 @@ CPU Cost	~20-40 cycles	100s-1000s cycles under contention
 Memory Barriers	Single memory fence	Multiple barriers
 Context Switches	None	Potential multiple switches under contention
 Kernel Transitions	None	Possible WAIT/SIGNAL transitions
+
 Key Advantage: Interlocked operations use CPU-level atomic instructions (LOCK XADD on x86/x64) that don't require thread suspension, delivering 10-100x better performance under contention.
 
 Cache Line Dynamics
+
 Current Implementation
 Complex dictionary structure with multiple internal locks
 Scattered memory access patterns
 Multiple threads fighting over the same dictionary bucket locks
+
 Proposed Implementation
 Contiguous array layout with predictable access patterns
 Single atomic counter as the only contention point
 Better spatial locality for recently allocated strings
+
 Optimization Required: The atomic counter could become a hotspot due to false sharing. You should use cache line padding to isolate the counter:
 
-F#
+```F#
 [<StructLayout(LayoutKind.Explicit, Size = 128)>]  // Two cache lines
 type PaddedCounter = 
     [<FieldOffset(0)>]
     mutable Value: int64
     // Rest is padding
+```
+
 Memory Consumption Analysis
 Pool Type	Configuration	Array Size	Approx Memory Cost
 Global Pool	High Performance	15K strings	~900KB
 Group Pools (10)	High Performance	25K each	~15MB
 Local Pools (50)	High Performance	1K each	~3MB
 Total Pre-allocation			~19MB
+
 Cost Assessment: The memory overhead is significant but not prohibitive on modern systems. This pre-allocation ensures predictable performance but does increase baseline memory usage. For memory-constrained environments, you could scale these sizes down proportionally.
 
 Concurrency Risk Assessment
@@ -422,14 +468,16 @@ Risk Type	Current Design	Proposed Design
 Deadlock	High - Multiple lock acquisition paths	Very Low - Minimal lock usage
 Livelock	Moderate - Lock retry patterns	Very Low - Atomic operations guarantee progress
 Thread Starvation	High - Convoy effect in dictionary locks	Low - Lock-free allocation path
+
 New Edge Cases:
 
 Array overflow handling must be robust
 Rare but possible ABA problems if using naive dictionary fallback
+
 Implementation Sketch
 Here's how the core interning method would look:
 
-F#
+```F#
 member this.InternString(str: string) : StringId =
     Interlocked.Increment(&this.Stats.accessCount) |> ignore
     
@@ -455,6 +503,8 @@ member this.InternString(str: string) : StringId =
             else
                 // Array full - fallback with timeout
                 this.InternStringWithFallback(str, 100)  // 100ms timeout
+```
+
 Application to Your Workload
 This solution is particularly well-suited to your workload pattern:
 
@@ -465,11 +515,13 @@ JSON Input Strings:
 Repetitive JSON labels (like "product-id") will be efficiently cached
 The high-churn unique values will benefit most from atomic array allocation
 The parallel processing of JSON chunks will see dramatically reduced contention
+
 Output RDF Terms:
 
 High-frequency strings benefit most from the lock-free approach
 Repeatedly constructed IRIs will hit local worker caches
 Benchmarking Guidance
+
 To verify this solution:
 
 Implement the array allocation with proper padding
@@ -486,6 +538,7 @@ The solution trades a modest increase in baseline memory usage (19MB for high-pe
 This approach aligns perfectly with the tiered design of your string pool, enhancing rather than replacing its core architecture.
 
 You said: Can you explain the padded counter please?
+
 Can you explain the padded counter please? Do I place it in a pool field in call `Interlocked.Increment(&this.NextRuntimeIndex.Value)` on it? I cannot pass a user defined struct to `Increment`.
 Copilot said: # Cache Line Padding Explained You're right about
 Cache Line Padding Explained
@@ -496,7 +549,7 @@ Cache line padding is a technique to prevent "false sharing" - a performance pro
 
 Here's the proper way to implement it in F#:
 
-F#
+```F#
 type GlobalPool = {
     // Existing fields...
     
@@ -511,15 +564,21 @@ type GlobalPool = {
     Pad8: int64; Pad9: int64; Pad10: int64; Pad11: int64;
     Pad12: int64; Pad13: int64; Pad14: int64;
 }
+```
+
 Then you use it normally:
 
-F#
+```F#
 Interlocked.Increment(&this.NextRuntimeId)
+```
+
 Alternatives for F#
+
 Since this padding approach is verbose, there are better alternatives in F#:
 
 1. Use Attributes (Recommended)
-F#
+
+```F#
 type GlobalPool = {
     // Existing fields...
     
@@ -529,8 +588,10 @@ type GlobalPool = {
     [<FieldOffset(128)>] // Ensure next field starts after another cache line
     RuntimeStringsArray: string[]
 }
+```
 2. Use a Simple Class with Separation
-F#
+
+```F#
 type PaddedCounters() =
     // Each counter gets its own cache line
     [<DefaultValue>] val mutable GlobalCounter: int64    // Cache line 1
@@ -542,10 +603,12 @@ type PaddedCounters() =
     member this.Init() =
         this.Padding1 <- Array.zeroCreate 64
         this.Padding2 <- Array.zeroCreate 64
+```
+
 Practical Implementation
 In your case, the simplest solution is to just ensure each mutable counter variable is in a different pool type:
 
-F#
+```F#
 type GlobalPool = {
     // Other fields...
     mutable NextRuntimeId: int32  // Only modified in GlobalPool
@@ -560,11 +623,14 @@ type LocalPool = {
     // Other fields...
     mutable NextLocalId: int32    // Only modified in LocalPool
 }
+```
+
 Since these are in different types, they naturally end up at different memory locations. The concern about false sharing primarily arises when you have multiple counters in the same structure that are accessed by different threads.
 
 The key insight is: as long as two frequently-modified variables accessed by different threads are at least 64 bytes apart in memory, you've avoided the false sharing problem.
 
 You said: I will indeed need to use Attributes
+
 I will indeed need to use Attributes then, as there are already counters for the primary data storage arrays, and these additional 'runtime arrays' are for overflow values. I would assume that the ideal layout is to place the fields that will be passed to increment contiguously at the start of pool type definition, with [<FieldOffset(64)>] used on each counter to help avoid false reads...
 
 How will the FieldOffset attribute work on the pool type definitions, which hold a variety of other objects in their member fields, such as `FastMap` references and the like? In this design, every field must use the offset attribute to indicate its position within the type.
@@ -589,6 +655,7 @@ Interlocked.Increment(&this.Offsets.RuntimeNext)
 ```
 
 Will this deal with the issue of false reads appropriately?
+
 Copilot said: # Cache Line Padding with Offsets Struct Your
 Cache Line Padding with Offsets Struct
 Your approach using a dedicated Offsets struct is indeed a good solution! This approach has several advantages:
@@ -599,7 +666,8 @@ It's reusable between different pool types
 However, there are a few corrections needed to make it work properly:
 
 Correct Implementation
-F#
+
+```F#
 [<Struct; StructLayout(LayoutKind.Explicit, Size = 128)>]
 type Offsets = 
     [<FieldOffset(0)>]
@@ -616,6 +684,8 @@ type GlobalPool = {
     mutable Offsets: Offsets
     mutable Stats: Stats    
 }
+```
+
 Important Changes
 Struct Declaration: F# record-like syntax (with {}) creates immutable records. Instead, use the explicit struct declaration with mutable fields.
 
@@ -624,7 +694,7 @@ Size Parameter: Adding Size = 128 ensures the struct takes exactly 128 bytes (2 
 Constructor: Adding a constructor makes it easier to initialize the struct.
 
 Usage
-F#
+```F#
 // Initialization
 let pool = { 
     // other fields
@@ -634,16 +704,20 @@ let pool = {
 
 // Access code
 let newId = Interlocked.Increment(&pool.Offsets.RuntimeNext)
+```
+
 False Sharing Prevention
 This approach effectively prevents false sharing because:
 
 FixedNext and RuntimeNext are on different cache lines (64 bytes apart)
 The struct is defined to be exactly 128 bytes, ensuring other fields don't accidentally share these cache lines
+
 Since Offsets is a dedicated structure, it's clear to future developers that these fields are separated for performance reasons
+
 Application to Both Pool Types
 You can use this same Offsets structure in both GlobalPool and GroupPool:
 
-F#
+```F#
 type GlobalPool = {
     // Existing fields...
     mutable Offsets: Offsets
@@ -655,6 +729,8 @@ type GroupPool = {
     mutable Offsets: Offsets
     // ...
 }
+```
+
 This gives you consistent performance characteristics across both pool types.
 
 This solution is elegant and addresses the false sharing issue appropriately while maintaining a clean architecture. It's a good balance between performance optimization and code readability.
@@ -683,7 +759,8 @@ Comprehensive Solution
 Here's a detailed design that prevents these ABA problems:
 
 1. Enhanced Data Structures
-F#
+
+```F#
 // Padded counters to prevent false sharing
 [<Struct; StructLayout(LayoutKind.Explicit, Size = 192)>]
 type Offsets = 
@@ -723,8 +800,11 @@ type GlobalPool = {
     OverflowIdToString: ConcurrentDictionary<int, string>
     OverflowLock: ReaderWriterLockSlim         // Fine-grained locking for overflow
 }
+```
+
 2. Thread-Safe String Interning with ABA Protection
-F#
+
+```F#
 member this.InternString(str: string) : StringId =
     if isNull str || str.Length = 0 then
         raise (ArgumentException "String cannot be null or empty")
@@ -823,8 +903,11 @@ member private this.InternStringWithOverflow(str: string) : StringId =
         finally
             if this.OverflowLock.IsUpgradeableReadLockHeld then
                 this.OverflowLock.ExitUpgradeableReadLock()
+```
+
 3. Enhanced String Lookup with Tier-Awareness
-F#
+
+```F#
 member this.GetString(id: StringId) : string option =
     let idValue = id.Value
     
@@ -866,7 +949,10 @@ member this.GetString(id: StringId) : string option =
     // Not in our ranges - delegate to appropriate tier
     else
         None  // Handle in caller
+```
+
 Key Anti-ABA Mechanisms
+
 Two-Phase Commit Pattern: The overflow dictionary operations use a reader-writer lock with an upgradeable read pattern that prevents inconsistent state.
 
 Timeout Handling: All lock acquisitions include timeouts to prevent deadlocks.
