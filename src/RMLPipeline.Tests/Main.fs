@@ -4,7 +4,7 @@
         open Expecto
         open RMLPipeline.Tests.VocabSuite
         open RMLPipeline.Tests.TemplateTests
-        open RMLPipeline.Tests.StringPoolTests
+        open RMLPipeline.Tests.StringInterningTests
         open RMLPipeline.Tests.PlannerModelTests
         // open RMLPipeline.Tests.PipelineModelBased
 
@@ -18,7 +18,7 @@
 
             let allTests = 
                 testList "RMLPipeline" [
-                    allStringPoolTests
+                    allStringInterningTests
                     allComputationRMLTests
                     allTemplateTests
                     allStatefulPlannerTests

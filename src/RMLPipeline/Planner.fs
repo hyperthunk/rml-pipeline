@@ -71,7 +71,7 @@ module Planner =
     open RMLPipeline
     open RMLPipeline.FastMap.Types
     open RMLPipeline.Model
-    open RMLPipeline.Internal.StringInterning
+    open RMLPipeline.Internal.StringInterning_1
 
     /// <summary>
     /// Memory modes for the planner, allowing adaptive behavior based on 

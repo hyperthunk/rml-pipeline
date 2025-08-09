@@ -12,6 +12,8 @@
     <Compile Include="RMLCoreGenerators.fs" />
     <Compile Include="RMLVocabTests.fs" />
     <Compile Include="TemplateTests.fs" />
+    <Compile Include="StringInterningGenerators.fs" />
+    <Compile Include="StringPoolTests.fs" />
     <Compile Include="StringInterningTests.fs" />
     <Compile Include="PlannerModelTests.fs" />
     <!-- <Compile Include="PipelineModelTests.fs" /> -->

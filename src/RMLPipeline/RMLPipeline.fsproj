@@ -12,6 +12,7 @@
     <Compile Include="Templates.fs" />
     <Compile Include="DSL.fs" />
     <Compile Include="StringPool.fs" />
+    <Compile Include="StringInterning.fs" />
     <Compile Include="Streaming.fs" />
     <Compile Include="Planner.fs" />
     <!-- <Compile Include="Pipeline.fs" /> -->

@@ -7,7 +7,7 @@ open RMLPipeline.Model
 open RMLPipeline.DSL
 open RMLPipeline.Internal
 open RMLPipeline.Internal.Planner
-open RMLPipeline.Internal.StringInterning
+open RMLPipeline.Internal.StringInterning_1
 open System
 
 module PlannerModelTests =

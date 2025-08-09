@@ -94,7 +94,7 @@ convoy effect associated with high contention on the global pool.
 *)
 
 
-module StringInterning =
+module StringInterning_1 =
 
     open RMLPipeline
     open RMLPipeline.FastMap.Types

@@ -11,7 +11,7 @@ open RMLPipeline
 open RMLPipeline.Core
 open RMLPipeline.Model
 open RMLPipeline.DSL
-open RMLPipeline.Internal.StringInterning
+open RMLPipeline.Internal.StringInterning_1
 
 (*
 AIMS
@@ -52,7 +52,7 @@ Invariant Checking: Ensures system properties are maintained
 
 *)
 
-module StringPoolTests =
+module StringInterningTests =
 
     module Generators =
         
@@ -1076,8 +1076,8 @@ module StringPoolTests =
     ]
 
     [<Tests>]
-    let allStringPoolTests = 
-        testList "StringPool" [
+    let allStringInterningTests = 
+        testList "StringInterning" [
             testList "FsCheck" propertyTests
             testList "Bugfix" bugfixTests
             testList "Robustness" performanceTests
