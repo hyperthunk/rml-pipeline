@@ -9,7 +9,7 @@ module Core =
     // State monad ish thing
     type State<'S, 'T> = State of ('S -> 'T * 'S)
     
-    // thanks for the insp, Haskell :)
+    // thanks for the inspo, Haskell :)
     let runState (State f) state = f state
     let evalState (State f) state = fst (f state)
     let execState (State f) state = snd (f state)
@@ -55,7 +55,7 @@ module Core =
         return f x y
     }
 
-       
+    (* Scalar (e.g., attribute/column) value handling *)       
     type RMLValue =
         | StringValue of string
         | IntValue of int64        // Use int64 to handle all integer types
@@ -108,7 +108,45 @@ module Core =
         | :? decimal as d -> DecimalValue d |> Some
         | _ -> None
 
-    // Type-safe context - replaces Dictionary<string, obj>
+    (* RML String Interning Types *)
+    
+    [<Struct>]
+    type StringId = StringId of int64
+        with 
+        member inline this.Value = 
+            let (StringId id) = this in int32 (id &&& 0xFFFFFFFFL)
+        
+        static member op_Explicit(id: StringId) = id.Value
+
+        member inline this.IsValid = this.Value >= 0
+
+        member inline this.Temperature = 
+            let (StringId id) = this in int32 (id >>> 32)
+        
+        /// Increment temperature by one. NB: wraps to zero if we overflow int32
+        member inline this.IncrementTemperature() : StringId =
+            let (StringId id) = this
+            // Atomic increment of temperature bits
+            let newId = id + (1L <<< 32)
+            if int32 (newId >>> 32) < 0 then
+                // If we've overflowed, reset temperature to 1
+                // NB: to keep this inline friendly we have to repeat outselves...
+                StringId (id &&& 0xFFFFFFFFL ||| (1L <<< 32))         
+            else
+                StringId newId
+        
+        member inline this.WithTemperature(temp: int32) =
+            let (StringId id) = this
+            let maskedId = id &&& 0xFFFFFFFFL
+            StringId (maskedId ||| (int64 temp <<< 32))
+        
+        static member inline Create(id: int32) : StringId = 
+            StringId (int64 id)
+        
+        static member Invalid = StringId -1L
+
+    (* RML Planning Types *)
+
     [<Struct>]
     type Context = {
         Values: FastMap<string, RMLValue>
@@ -157,39 +195,8 @@ module Core =
         let toStringMap (context: Context) : FastMap<string, string> =
             context.Values
             |> FastMap.fold (fun acc k value -> FastMap.add k (value.AsString()) acc) FastMap.empty
-
-    // Type-safe stream token
-    [<Struct>]
-    type StreamToken = {
-        TokenType: JsonToken
-        Value: RMLValue
-        Path: string
-        Depth: int
-        IsComplete: bool
-        Context: Context option
-    }
     
-    let mkStreamToken tokenType value path isComplete context = {
-        TokenType = tokenType
-        Value = value
-        Path = path
-        Depth = path.Split('.').Length
-        IsComplete = isComplete
-        Context = context
-    }
-        
-        (* let fromLegacyToken (legacyToken: StreamToken) : TypedStreamToken =
-            let rmlValue = 
-                RMLValue.TryParse(legacyToken.Value) 
-                |> Option.defaultValue NullValue
-            {
-                TokenType = legacyToken.TokenType
-                Value = rmlValue
-                Path = legacyToken.Path
-                Depth = legacyToken.Depth
-                IsComplete = legacyToken.IsComplete
-                Context = None
-            } *)
+    (* Template Expansion Types *)
 
     // Template expansion errors
     type TemplateError =
@@ -202,48 +209,3 @@ module Core =
         | Success of string
         | Error of TemplateError
     
-
-    // Enhanced predicate tuple with type safety
-    [<Struct>]
-    type PredicateTuple = {
-        SubjectTemplate: string
-        PredicateValue: string
-        ObjectTemplate: string
-        ObjectDatatype: XsdType option
-        ObjectLanguage: string option
-        IsConstant: bool
-        SourcePath: string
-        Hash: uint64
-        ExpectedValueTypes: RMLValueType Set  // What types we expect in the context
-    }
-    
-    and RMLValueType =
-        | StringType
-        | IntType  
-        | FloatType
-        | BoolType
-        | DateTimeType
-        | DecimalType
-        | ArrayType of RMLValueType
-        | ObjectType
-    
-    and XsdType =
-        | XsdString
-        | XsdInt
-        | XsdFloat
-        | XsdBoolean
-        | XsdDateTime
-        | XsdDecimal
-        | XsdDouble
-        | XsdAnyUri
-        | XsdDate
-        | XsdTime
-        | XsdDuration
-        | XsdBase64Binary
-        | XsdHexBinary
-        | XsdAnyType
-    
-    // Type-safe triple generation
-    type TripleGenerationResult =
-        | TripleGenerated of subject: string * predicate: string * object: string * datatype: XsdType option
-        | TripleGenerationError of error: TemplateError

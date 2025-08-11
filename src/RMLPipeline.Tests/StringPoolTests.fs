@@ -6,11 +6,13 @@ open System.Threading.Tasks
 open System.Collections.Generic
 open System.Collections.Concurrent
 open System.Diagnostics
-open FsCheck
 open Expecto
+open Expecto.ExpectoFsCheck
+open FsCheck
 open RMLPipeline
+open RMLPipeline.Core
 open RMLPipeline.FastMap.Types
-open RMLPipeline.Internal.StringInterning
+open RMLPipeline.Internal.StringPooling
 open FSharp.HashCollections
 open StringInterningGenerators
 
@@ -114,13 +116,17 @@ module StringPoolTests =
             
             afterDecay < beforeDecay && afterDecay > 0
 
-    // ==================== Segments Tests ====================
+    let poolConfig = { FsCheckConfig.defaultConfig with 
+                        arbitrary = [ typeof<StringInterningArbitraries> ] }
+
     module SegmentsTests =
         module SingleThreaded =
             [<Tests>]
             let tests =
                 testList "SingleThreadedSegmentsTests" [
-                    testProperty "AllocateString assigns unique IDs" <| fun (config: PoolConfiguration) ->
+                    testPropertyWithConfig 
+                            poolConfig 
+                            "AllocateString assigns unique IDs" <| fun (config: PoolConfiguration) ->
                         // Create segments
                         let baseId = 1000
                         use segments = TestHelpers.createTestSegments baseId config
@@ -287,12 +293,16 @@ module StringPoolTests =
     // ==================== Pool Tests ====================
     module PoolTests =
         module SingleThreaded =
+            
             [<Tests>]
             let tests =
                 testList "SingleThreadedPoolTests" [
-                    testProperty "InternString assigns sequential IDs in eden space" <| fun (config: PoolConfiguration) ->
+                    testPropertyWithConfig 
+                            poolConfig
+                            "InternString assigns sequential IDs in eden space" <| fun (config: PoolConfiguration) ->
                         // Create pool with reasonable eden size
                         let baseId = 1000
+                        printfn "Test Configuration: %A" config
                         let edenSize = min config.GlobalEdenSize 100 // Keep test manageable
                         let pool = TestHelpers.createTestPool baseId edenSize config
                         
@@ -301,7 +311,7 @@ module StringPoolTests =
                         let ids = strings |> Array.map pool.InternString
                         
                         // Verify IDs are sequential and in expected range
-                        let expectedIds = [| for i in 0..strings.Length-1 -> StringId(baseId + i) |]
+                        let expectedIds = [| for i in 0..strings.Length-1 -> StringId.Create(baseId + i) |]
                         ids = expectedIds
                     
                     testProperty "Round-trip string interning works" <| fun (strings: string[]) ->
@@ -348,7 +358,7 @@ module StringPoolTests =
                         // Create pool with short promotion interval
                         let config = { 
                             PoolConfiguration.Default with 
-                                MinPromotionInterval = TimeSpan.FromMilliseconds(1.0)
+                                MinPromotionInterval = TimeSpan.FromMilliseconds 1.0
                         }
                         let baseId = 1000
                         let edenSize = 10
@@ -356,7 +366,7 @@ module StringPoolTests =
                         
                         // Create hot string in eden
                         let edenString = "hot_eden_string"
-                        let _ = pool.InternString(edenString)
+                        let _ = pool.InternString edenString
                         pool.EdenTemperatures.AddOrUpdate(edenString, 10, fun _ _ -> 10) |> ignore
                         Interlocked.Exchange(&pool.PromotionSignalCount, 1L) |> ignore
                         
@@ -996,6 +1006,4 @@ module StringPoolTests =
             PromotionTests.tests
             HierarchyTests.tests
         ]
-
-    // Register arbitraries
-    do Arb.register<StringInterningGenerators.StringPoolArbitraries>() |> ignore
+    

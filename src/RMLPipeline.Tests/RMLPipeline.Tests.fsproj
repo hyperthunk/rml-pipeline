@@ -13,6 +13,7 @@
     <Compile Include="RMLVocabTests.fs" />
     <Compile Include="TemplateTests.fs" />
     <Compile Include="StringInterningGenerators.fs" />
+    <Compile Include="TypeLevelTests.fs" />
     <Compile Include="StringPoolTests.fs" />
     <Compile Include="StringInterningTests.fs" />
     <Compile Include="PlannerModelTests.fs" />

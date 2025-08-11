@@ -1,231 +1,16 @@
 namespace RMLPipeline.Internal
 
-(*
-    Provides a hierarchical implementation of string interning, designed to meet 
-    the needs of a parallel processing architecture, while providing efficient 
-    memory usage and performance characteristics.
-
-    This is a specialized, bounded, reference-counted string management approach 
-    that is more efficient for RML processing patterns than relying solely on .NET's 
-    general-purpose, global string interning mechanism.
-
-    Routing is dynamic, based on the requested StringAccessPattern, providing
-    automatic fallback between tiers, with preferential checking, where high-frequency 
-    requests try local pools first, whilst planning requests route to global pool.
-
-    When a string is interned at a higher tier (Group or Global), it gets a StringId 
-    from that tier's range. If wokers require frequent access, the string doesn't move, 
-    but rather the worker simply caches the lookup locally.
-
-    This is a three-tiered design that attempts to balances contention, 
-    memory usage, and access patterns.
-
-    Planning Strings (Global Pool):
-    - Templates like "http://example.org/{id}"
-    - Shared across all workers
-    - Lock-free reads for planning strings
-    - Array-backed for cache efficiency
-
-    Group Strings (Group Pool):
-    - Predicates specific to a dependency group
-    - Shared within group only - bounded contention within dependency groups
-    - Reduces global pool contention
-
-    Worker Strings (Local Pool):
-    - Temporary strings during processing
-    - Zero contention access for hot paths
-    - Bounded size prevents memory bloat
-
-    All strings produced during the planning phase are pre-allocated and immutable.
-    The RAII pattern is provided using the PoolContextScope.
-
-    Goals:
-    - Lock-free reads from global planning strings
-    - Fine-grained locking only where necessary
-    - Value types for IDs and patterns
-    - Aggressive inlining where beneficial
-    - No thread affinity
-    - Can be used with both F# async and Hopac (for parallel processing)
-
-    Note: Avoiding coordination overheads & memory optimization.
-
-    1. StringId tells you where the string lives - no searching through tiers
-
-    Leveraging a generational design, we maintain precise ID-to-location mapping:
-
-    Planning strings: 0 to PlanningCount-1
-    Global runtime: PlanningCount to GlobalRuntimeBase-1
-    Group pool: GroupPoolBase to LocalPoolBase-1
-    Local pool: LocalPoolBase onward
-
-    Within each pool, the ID tells us exactly where to look:
-
-    - Eden space or chunked array
-    - Which chunk and offset within that chunk
-
-    Even emergency allocations (see below) have deterministic ID ranges, giving 
-    us O(1) lookups with a maximum of one redirection.
-
-    2. Cache-friendly lookups - direct array access in the owning tier
-
-    For the primary access patterns:
-
-    - Planning strings maintain direct array access (best cache locality)
-    - Eden space strings maintain direct array access (excellent cache locality)
-    - Chunked arrays access via one indirection (cache locality within chunks)
-    - Chunks are designed to preserve cache-friendliness
-
-    Each chunk is a contiguous array, maintaining good cache properties:
-
-    - Sequential access within chunks is cache-efficient
-    - Chunk sizes grow with usage patterns, balancing locality and memory usage
-    - Temperature tracking groups hot strings together for promotion
-
-    3. Controlled string duplication during incremental promotion
-
-    Rather than maintaining a strict "one tier only" policy, we implement a controlled 
-    promotion mechanism that temporarily allows strings to exist in multiple tiers. 
-    Hot strings (frequently accessed) are incrementally promoted to higher tiers while 
-    maintaining references in lower tiers until they're naturally evicted.
-
-    The promotion process works through a temperature tracking system:
-    - String access increases a temperature counter
-    - When temperature exceeds an adaptive threshold, the string is flagged for promotion
-    - Promotion is signaled through atomic counters to avoid contention
-    - The string is interned in the higher tier while still accessible in the lower tier
-    - Lower tier temperature is reset to prevent continuous promotion
-
-    This incremental approach maintains lock-freedom while ensuring hot strings 
-    eventually migrate to the most appropriate tier without blocking operations.
-
-    4. Emergency Allocation Mechanism
-
-    To ensure forward progress even in extreme contention scenarios, each tier includes 
-    an emergency allocation pathway. If lock acquisition times out during chunk allocation:
-    - The string is added to a concurrent dictionary with a special ID range
-    - This provides guaranteed forward progress without blocking
-    - Emergency allocations are still deterministically addressable
-    - Temperature tracking continues to work for emergency-allocated strings
-
-    This mechanism ensures the system remains responsive even under pathological 
-    contention conditions, providing a fallback that maintains all core guarantees.
-
-    Commit Comment (TBD):
-    Thread Safety and Deadlock Avoidance:
-
-    Earlier versions of the pool utilised snapshots to establish a consistent 
-    view of global pool size, such that group pools would know which Ids are
-    already taken globally, whether to check the global pool for a string, and
-    when to refresh their view of global state.
-
-    Unfortunately it proved difficult to implement snapshots without encountering
-    various interwoven deadlock conditions under load testing. We have therefore
-    moved to a lock-free design for the pool, which works as follows:
-
-    Core Design Principles
-
-    * Immutable planning strings (these remain from the previous design)
-    * Lock-Free runtime additions using only atomic operations
-    * Stable ID ranges that maintain our ID allocation strategy
-    * Snapshot-Free coordination using atomic counters
-    * Incremental (mostly lock-free) promotion of hot strings
-    * Emergency allocation pathways for extreme contention scenarios
-
-*)
-
-
-module StringInterning =
-
+module StringPooling =
+    
+    open FSharp.HashCollections
     open RMLPipeline
-    open RMLPipeline.FastMap.Types
-    open RMLPipeline.Internal.StringPooling
     open RMLPipeline.Core
+    open RMLPipeline.FastMap.Types
     open System
     open System.Collections.Concurrent
     open System.Collections.Generic
-    open System.Threading
-    open System.Runtime.CompilerServices
-    open System.Runtime.InteropServices
     open System.Diagnostics
-    open FSharp.HashCollections
-
-    (*[<Struct>]
-    type StringId = StringId of int32
-        with 
-        member inline this.Value = let (StringId id) = this in id
-        static member inline op_Explicit(id: StringId) = id.Value
-        static member Invalid = StringId -1
-        member inline this.IsValid = this.Value >= 0
-
-    [<Struct>]
-    type StringId = StringId of int64
-        with 
-        member inline this.Value = 
-            let (StringId id) = this in int32 (id &&& 0xFFFFFFFFL)
-
-        member inline this.IsValid = this.Value >= 0
-
-        static member inline op_Explicit(id: StringId) = id.Value
-        
-        member inline this.Temperature = 
-            let (StringId id) = this in int32 (id >>> 32)
-        
-        member inline this.IncrementTemperature() =
-            let (StringId id) = this
-            // Atomic increment of temperature bits
-            StringId (id + (1L <<< 32))
-        
-        member inline this.WithTemperature(temp: int32) =
-            let (StringId id) = this
-            let maskedId = id &&& 0xFFFFFFFFL
-            StringId (maskedId ||| (int64 temp <<< 32))
-        
-        static member inline Create(id: int32) = 
-            StringId (int64 id) *)
-
-    (* [<Struct>]
-    type WorkerId = WorkerId of Guid
-        with
-        member inline this.Value = let (WorkerId id) = this in id
-        static member Create() = WorkerId(Guid.NewGuid())
-
-    [<Struct>]
-    type DependencyGroupId = DependencyGroupId of int32
-        with
-        member inline this.Value = let (DependencyGroupId id) = this in id
-
-    [<Flags>]
-    type StringAccessPattern =
-        | Unknown = 0
-        | HighFrequency = 1
-        | MediumFrequency = 2
-        | LowFrequency = 4
-        | Planning = 8
-        | Runtime = 16
-
-    [<Struct>]
-    type PoolStats = {
-        TotalStrings: int
-        MemoryUsageBytes: int64
-        HitRatio: float
-        AccessCount: int64
-        MissCount: int64
-        AverageTemperature: float  // Average temperature across all strings
-        MaxTemperature: int32      // Highest temperature in any chunk
-        HotStringsCount: int       // Number of strings above promotion threshold
-        PendingPromotions: int64   // Signals for strings awaiting promotion
-    } with 
-        static member Empty = {
-            TotalStrings      = 0
-            MemoryUsageBytes  = 0L
-            HitRatio          = 0.0
-            AccessCount       = 0L
-            MissCount         = 0L
-            AverageTemperature = 0.0
-            MaxTemperature    = 0
-            HotStringsCount    = 0
-            PendingPromotions  = 0L
-        }
+    open System.Threading
 
     // Configuration for adaptive sizing and thresholds
     type PoolConfiguration = {
@@ -328,6 +113,261 @@ module StringInterning =
             MaxPromotionBatchSize = 100
         }
 
+    [<Struct>]
+    type Stats = {
+        mutable accessCount: int64
+        mutable missCount: int64
+    }
+        
+    [<Struct>]
+    type PromotionSignal = {
+        StringId: StringId
+        Temperature: int32
+        Timestamp: int64
+    }
+
+    [<Struct>]
+    type PromotionCandidate = {
+        Value: string
+        Temperature: int32
+    }
+
+    (*
+        Circular Buffer for queuing promotion signals.
+        Lock-free and degrades fairly gracefully to single-threaded
+        processing, with only Interlocked ops as cost.
+    *)
+    type PromotionQueue = {
+        Buffer: PromotionSignal[]
+        BufferMask: int32  // For fast modulo
+        MinPromotionInterval: TimeSpan
+        mutable Head: int64
+        mutable Tail: int64
+        mutable LastProcessedTime: int64
+    } with
+        static member Create(sizeBits: int) =
+            let size = 1 <<< sizeBits  // Power of 2
+            {
+                Buffer = Array.zeroCreate size
+                BufferMask = size - 1
+                MinPromotionInterval = TimeSpan.FromSeconds 0.2
+                Head = 0L
+                Tail = 0L
+                LastProcessedTime = 0L
+            }
+        
+        member this.TryEnqueue(signal: PromotionSignal) : bool =
+            let mutable tail = Volatile.Read &this.Tail
+            let mutable head = Volatile.Read &this.Head
+            
+            // Check if queue is full (with one slot buffer)
+            if tail - head >= int64 this.Buffer.Length - 1L then
+                false  // Queue full, promotion signal dropped (acceptable)
+            else
+                let index = int (tail &&& int64 this.BufferMask)
+                this.Buffer.[index] <- signal
+                
+                // Memory barrier to ensure write completes before advancing tail
+                Thread.MemoryBarrier()
+                Interlocked.Increment &this.Tail |> ignore
+                true
+        
+        member this.TryDequeueBatch(maxCount: int) : PromotionSignal[] =
+            let now = Stopwatch.GetTimestamp()
+            
+            // Check minimum interval using atomic swap
+            let lastTime = Volatile.Read &this.LastProcessedTime
+            let elapsed = now - lastTime
+            let minTicks = int64 (this.MinPromotionInterval.TotalMilliseconds * 
+                                float Stopwatch.Frequency / 1000.0)
+            
+            if elapsed < minTicks then
+                [||]  // Too soon
+            else
+                // Try to claim the promotion window
+                if Interlocked.CompareExchange(&this.LastProcessedTime, now, lastTime) <> lastTime then
+                    [||]  // Another thread is processing
+                else
+                    // We have exclusive access to dequeue
+                    let mutable head = Volatile.Read(&this.Head)
+                    let tail = Volatile.Read(&this.Tail)
+                    let available = int (tail - head)
+                    let toDequeue = min available maxCount
+                    
+                    if toDequeue > 0 then
+                        let results = Array.zeroCreate toDequeue
+                        for i = 0 to toDequeue - 1 do
+                            let index = int ((head + int64 i) &&& int64 this.BufferMask)
+                            results.[i] <- this.Buffer.[index]
+                        
+                        // Advance head
+                        Interlocked.Add(&this.Head, int64 toDequeue) |> ignore
+                        results
+                    else
+                        [||]
+
+    type EpochPromotionTracker = {
+        (* There are 3 epochs: 
+            1. being written
+            2. cooling off
+            3. being processed *)
+        EpochQueues: PromotionQueue[]
+        mutable CurrentWriteEpoch: int32
+        mutable LastRotationTime: int64
+        RotationInterval: TimeSpan
+        ProcessingLock: obj  // Only for the processing thread
+    } with
+        static member Create(queueSizeBits: int, rotationInterval: TimeSpan) =
+            {
+                EpochQueues = Array.init 3 (fun _ -> PromotionQueue.Create queueSizeBits)
+                CurrentWriteEpoch = 0
+                LastRotationTime = Stopwatch.GetTimestamp()
+                RotationInterval = rotationInterval
+                ProcessingLock = obj()
+            }
+        
+        // Called by any thread to signal a promotion
+        member this.SignalPromotion(id: StringId, temp: int32) : bool =
+            // Fast path - just read the current epoch and enqueue
+            let epoch = Volatile.Read &this.CurrentWriteEpoch
+            let queue = this.EpochQueues.[epoch % 3]
+            
+            let signal = {
+                StringId = id
+                Temperature = temp
+                Timestamp = Stopwatch.GetTimestamp()
+            }
+            
+            queue.TryEnqueue signal
+        
+        // Check if it's time to rotate epochs
+        member private this.CheckRotation() : bool =
+            let now = Stopwatch.GetTimestamp()
+            let lastRotation = Volatile.Read(&this.LastRotationTime)
+            let elapsed = now - lastRotation
+            let intervalTicks = int64 (this.RotationInterval.TotalMilliseconds * 
+                                    float Stopwatch.Frequency / 1000.0)
+            
+            if elapsed >= intervalTicks then
+                // Try to claim the rotation
+                Interlocked.CompareExchange(&this.LastRotationTime, now, lastRotation) = lastRotation
+            else
+                false
+        
+        // Process promotions - called periodically by promotion processing thread
+        member this.ProcessPromotions(resolver: StringId -> string option) : PromotionCandidate[] =
+            // First check if we should rotate
+            if this.CheckRotation() then
+                Interlocked.Increment(&this.CurrentWriteEpoch) |> ignore
+            
+            // Only one thread should process at a time
+            if Monitor.TryEnter(this.ProcessingLock) then
+                try
+                    // Process the oldest epoch (2 rotations ago)
+                    let currentEpoch = Volatile.Read(&this.CurrentWriteEpoch)
+                    let processEpoch = (currentEpoch + 2) % 3 // +2 because we want 2 epochs ago
+                    let queue = this.EpochQueues.[processEpoch]
+                    
+                    // Drain the entire queue
+                    let mutable candidates = ResizeArray<PromotionCandidate>()
+                    let mutable batch = queue.TryDequeueBatch(1000)
+                    
+                    while batch.Length > 0 do
+                        for signal in batch do
+                            match resolver signal.StringId with
+                            | Some str ->
+                                candidates.Add({ Value = str; Temperature = signal.Temperature })
+                            | None -> ()
+                        
+                        batch <- queue.TryDequeueBatch(1000)
+                    
+                    // Deduplicate candidates
+                    candidates
+                    |> Seq.distinctBy (fun c -> c.Value)
+                    |> Seq.toArray
+                finally
+                    Monitor.Exit(this.ProcessingLock)
+            else
+                [||]  // Another thread is processing
+
+    (* For use in single-threaded execution *)
+    type RoundRobinEpochTracker = {
+        EpochQueues: PromotionQueue[]
+        mutable CurrentEpoch: int32
+        mutable RotationCounter: int32
+        RotationThreshold: int32  // Rotate after N operations
+    } with
+        member this.SignalPromotion(id: StringId, str: string, temp: int32) =
+            let queue = this.EpochQueues.[this.CurrentEpoch]
+            let signal = {
+                StringId = id
+                Temperature = temp
+                Timestamp = Stopwatch.GetTimestamp()
+            }
+            queue.TryEnqueue signal |> ignore
+            
+            // Check if we should rotate
+            this.RotationCounter <- this.RotationCounter + 1
+            if this.RotationCounter >= this.RotationThreshold then
+                this.CurrentEpoch <- (this.CurrentEpoch + 1) % 3
+                this.RotationCounter <- 0
+        
+        member this.ProcessPromotions(resolver) =
+            // Process the oldest epoch
+            let processEpoch = (this.CurrentEpoch + 1) % 3
+            let queue = this.EpochQueues.[processEpoch]
+            
+            // Drain and process
+            queue.TryDequeueBatch(Int32.MaxValue)
+            |> Array.choose (fun signal -> 
+                resolver signal.StringId 
+                |> Option.map (fun str -> { Value = str; Temperature = signal.Temperature }))
+
+    [<Flags>]
+    type StringAccessPattern =
+        | Unknown = 0
+        | HighFrequency = 1
+        | MediumFrequency = 2
+        | LowFrequency = 4
+        | Planning = 8
+        | Runtime = 16
+
+    [<Struct>]
+    type PoolStats = {
+        TotalStrings: int
+        MemoryUsageBytes: int64
+        HitRatio: float
+        AccessCount: int64
+        MissCount: int64
+        AverageTemperature: float  // Average temperature across all strings
+        MaxTemperature: int32      // Highest temperature in any chunk
+        HotStringsCount: int       // Number of strings above promotion threshold
+        PendingPromotions: int64   // Signals for strings awaiting promotion
+    } with 
+        static member Empty = {
+            TotalStrings      = 0
+            MemoryUsageBytes  = 0L
+            HitRatio          = 0.0
+            AccessCount       = 0L
+            MissCount         = 0L
+            AverageTemperature = 0.0
+            MaxTemperature    = 0
+            HotStringsCount    = 0
+            PendingPromotions  = 0L
+        }
+
+    [<Struct>]
+    type WorkerId = WorkerId of Guid
+        with
+        member inline this.Value = let (WorkerId id) = this in id
+        static member Create() = WorkerId(Guid.NewGuid())
+
+
+    [<Struct>]
+    type DependencyGroupId = DependencyGroupId of int32
+        with
+        member inline this.Value = let (DependencyGroupId id) = this in id
+
     // TODO: make IdAllocation limits available as runtime configuration
     module IdAllocation =
         // Fixed ranges that prevent ID collisions between pool tiers
@@ -353,39 +393,36 @@ module StringInterning =
                 // Global workers get ranges starting from LocalPoolBase
                 let workerHash = abs (workerId.Value.GetHashCode()) % 100000 // Max 100K global workers
                 LocalPoolBase + (workerHash * WorkerRangeSize)
-
-    [<Struct>]
-    type Stats = {
-        mutable accessCount: int64
-        mutable missCount: int64
-    }
-
-    [<Struct>]
-    type PromotionCandidate = {
-        Value: string
-        Temperature: int32
-    }
-
-    // Segmented array for dynamic growth with minimal locking
+    
+    (* 
+        Thread-safe chunked Array
+    *)
     type Segments = {
         Chunks: ResizeArray<string[]>
         ChunkSize: int
         mutable CurrentChunkIndex: int32
         mutable ChunkOffsets: int32[]  // One counter per chunk
         ChunksLock: ReaderWriterLockSlim
+        
+        // Emergency fallback for high contention scenarios
         EmergencyCache: ConcurrentDictionary<int, string>  // Fallback for timeout cases
         mutable EmergencyCounter: int32
         EmergencyBaseId: int
+        
         Configuration: PoolConfiguration
         
         // Temperature tracking with targeted approach
-        StringTemperatures: ConcurrentDictionary<string, int32>
-        mutable LastDecayTime: DateTime
         mutable LastPromotionTime: int64
         mutable PromotionSignalCount: int64
-        mutable PromotionThreshold: int
+
+        PromotionTracker: EpochPromotionTracker
+        mutable PromotionThreshold: int32
+        mutable StringCount: int32  // Track for adaptive threshold
     } with
         static member Create(baseId: int, config: PoolConfiguration) =
+            let rotationInterval = 
+                // Rotate faster than promotion interval to ensure smooth processing
+                TimeSpan.FromMilliseconds(config.MinPromotionInterval.TotalMilliseconds / 3.0)
             {
                 Chunks = ResizeArray<string[]>([| Array.zeroCreate config.InitialChunkSize |])
                 ChunkSize = config.InitialChunkSize
@@ -396,15 +433,18 @@ module StringInterning =
                 EmergencyCounter = 0
                 EmergencyBaseId = baseId + 900000  // Reserve high range for emergency
                 Configuration = config
-                StringTemperatures = ConcurrentDictionary<string, int32>()
-                LastDecayTime = DateTime.UtcNow
                 LastPromotionTime = 0L
                 PromotionSignalCount = 0L
+                PromotionTracker = EpochPromotionTracker.Create(
+                    queueSizeBits = 16,  // 64K promotion signals per epoch
+                    rotationInterval = rotationInterval
+                )
                 PromotionThreshold = 
                     if baseId < IdAllocation.GroupPoolBase then 
                         config.GroupPromotionThreshold 
                     else 
                         config.WorkerPromotionThreshold
+                StringCount = 0
             }
         
         member this.AllocateString(str: string, baseId: int) : StringId =
@@ -412,126 +452,127 @@ module StringInterning =
             let currentChunkIdx = Volatile.Read(&this.CurrentChunkIndex)
             let offset = Interlocked.Increment(&this.ChunkOffsets.[currentChunkIdx]) - 1
             
-            if offset < this.ChunkSize then
-                // Common case - chunk has space, no locks needed
-                let id = StringId(baseId + (currentChunkIdx * this.ChunkSize) + offset)
-                Volatile.Write(&this.Chunks.[currentChunkIdx].[offset], str)
-                
-                // Update temperature with atomic operation - completely lock-free
-                this.StringTemperatures.AddOrUpdate(str, 1, fun _ oldTemp -> 
-                    let newTemp = oldTemp + 1
-                    // Signal promotion if temperature crosses threshold
-                    if newTemp = this.PromotionThreshold then
-                        Interlocked.Increment(&this.PromotionSignalCount) |> ignore
-                    newTemp) |> ignore
-                    
-                id
-            else
-                // Rare case - need a new chunk
-                this.AllocateInNewChunk(str, baseId)
-       
+            let newId = 
+                if offset < this.ChunkSize then
+                    let id = StringId.Create(baseId + (currentChunkIdx * this.ChunkSize) + offset)
+                    Volatile.Write(&this.Chunks.[currentChunkIdx].[offset], str)
+                    id
+                else
+                    this.AllocateInNewChunk(str, baseId)
+            
+            // We leverage an adaptive threshold whilst tracking string allocations 
+            Interlocked.Increment(&this.StringCount) |> ignore
+            newId
+
+        member this.ProcessPromotions(baseId: int) : PromotionCandidate[] =
+            // Create resolver function that looks up strings by ID
+            let resolver (id: StringId) =
+                this.TryGetString(id.Value, baseId)
+
+            this.PromotionTracker.ProcessPromotions(resolver)
+
+        member inline private this.tryAcquireReadLock() =
+                this.ChunksLock.TryEnterUpgradeableReadLock(50)
+
+        member inline private this.tryAcquireWriteLock() =
+            this.ChunksLock.TryEnterWriteLock(50)
+
+        member inline private this.releaseReadLock() =
+            this.ChunksLock.ExitUpgradeableReadLock()
+
+        member inline private this.releaseWriteLock() =
+            this.ChunksLock.ExitWriteLock()
+
+        member inline private this.growChunksArray nextIdx =
+            // Calculate next chunk size with growth factor
+            let nextChunkSize = 
+                if this.Chunks.Count = 1 then
+                    this.Configuration.SecondaryChunkSize
+                else
+                    int (float this.ChunkSize * this.Configuration.ChunkGrowthFactor)
+                    |> min 50000  // Cap chunk size at 50K
+            
+            // Grow chunks array
+            this.Chunks.Add(Array.zeroCreate nextChunkSize)
+            
+            // Ensure offset array has space
+            if nextIdx >= this.ChunkOffsets.Length then
+                let newSize = this.ChunkOffsets.Length * 2
+                let newOffsets = Array.zeroCreate newSize
+                Array.Copy(this.ChunkOffsets, newOffsets, this.ChunkOffsets.Length)
+                this.ChunkOffsets <- newOffsets
+
+        member inline private this.allocateInNextChunk baseId str =
+            // Move to next chunk
+            let newChunkIdx = Interlocked.Increment(&this.CurrentChunkIndex)
+            let newOffset = Interlocked.Increment(&this.ChunkOffsets.[newChunkIdx]) - 1
+            
+            // Write string to new location
+            let id = StringId.Create(baseId + (newChunkIdx * this.ChunkSize) + newOffset)
+            Volatile.Write(&this.Chunks.[newChunkIdx].[newOffset], str)
+            
+            // Increment string count
+            Interlocked.Increment(&this.StringCount) |> ignore
+            id
+    
         member private this.AllocateInNewChunk(str: string, baseId: int) : StringId =
+            // the mutables here are fugly but safe(er)
             let mutable readLockHeld = false
             let mutable writeLockHeld = false
-           
             try
-                // First attempt upgradeable read lock with timeout
-                readLockHeld <- this.ChunksLock.TryEnterUpgradeableReadLock(50)
-                if not readLockHeld then
-                    // Timeout - use emergency allocation
-                    this.EmergencyAllocate str
-                else               
-                    // Under read lock, check if another thread already added a chunk
+                readLockHeld <- this.ChunksLock.TryEnterUpgradeableReadLock 50
+
+                if readLockHeld then
                     let currentIdx = Volatile.Read(&this.CurrentChunkIndex)
                     let nextIdx = currentIdx + 1
                     
                     // Check if we need a new chunk
-                    let needNewChunk = nextIdx >= this.Chunks.Count
-                    
-                    let panic = 
-                        if needNewChunk then
-                            // Check max chunks limit
-                            let hitLimit = 
-                                match this.Configuration.MaxChunks with
-                                | Some max when this.Chunks.Count >= max ->
-                                    // Hit max chunks - use emergency allocation
-                                    this.EmergencyAllocate str |> Some
-                                | _ -> None
-                            
-                            match hitLimit with
-                            | Some _ -> hitLimit
-                            | None ->
-                                // Only acquire write lock if absolutely needed
-                                writeLockHeld <- this.ChunksLock.TryEnterWriteLock(50)
-                                if not writeLockHeld then
-                                    // Write lock timeout - use emergency allocation
-                                    this.EmergencyAllocate str |> Some                                
-                                // Double-check under write lock
-                                else
-                                    if nextIdx >= this.Chunks.Count then
-                                        // Calculate next chunk size (with growth factor)
-                                        let nextChunkSize = 
-                                            if this.Chunks.Count = 1 then
-                                                    this.Configuration.SecondaryChunkSize
-                                            else
-                                                int (float this.ChunkSize * this.Configuration.ChunkGrowthFactor)
-                                                |> min 50000  // Cap chunk size at 50K
-                                        
-                                        // Actually grow the chunks array
-                                        this.Chunks.Add(Array.zeroCreate nextChunkSize)
-                                        
-                                        // Ensure offset array has space
-                                        if nextIdx >= this.ChunkOffsets.Length then
-                                            let newSize = this.ChunkOffsets.Length * 2
-                                            let newOffsets = Array.zeroCreate newSize
-                                            Array.Copy(this.ChunkOffsets, newOffsets, this.ChunkOffsets.Length)
-                                            this.ChunkOffsets <- newOffsets                                    
-                                    // hitLimit branch
-                                    None
-                        else 
-                            None                    
-                    if panic.IsSome then
-                        // Emergency allocation was triggered
-                        panic.Value
+                    if nextIdx < this.Chunks.Count then
+                        // Another thread already added the chunk
+                        this.allocateInNextChunk baseId str
                     else
-                        // Now safe to move to next chunk
-                        let newChunkIdx = Interlocked.Increment(&this.CurrentChunkIndex)
-                        let newOffset = Interlocked.Increment(&this.ChunkOffsets.[newChunkIdx]) - 1
-                        
-                        // Write string to new location
-                        let id = StringId(baseId + (newChunkIdx * this.ChunkSize) + newOffset)
-                        Volatile.Write(&this.Chunks.[newChunkIdx].[newOffset], str)
-                        
-                        // Update temperature - completely lock-free
-                        this.StringTemperatures.AddOrUpdate(str, 1, fun _ oldTemp -> 
-                            let newTemp = oldTemp + 1
-                            // Signal promotion if temperature crosses threshold
-                            if newTemp = this.PromotionThreshold then
-                                Interlocked.Increment(&this.PromotionSignalCount) |> ignore
-                            newTemp) |> ignore
-                            
-                        id
-               
+                        // Need to add a new chunk
+                        match this.Configuration.MaxChunks with
+                        | Some max when this.Chunks.Count >= max ->
+                            // Hit max chunks limit - use emergency allocation
+                            this.EmergencyAllocate str
+                        | _ ->
+                            // Try to acquire write lock
+                            writeLockHeld <- this.ChunksLock.TryEnterWriteLock 50
+                            if writeLockHeld then
+                                try
+                                    // Ensure we have enough space in the chunks array
+                                    if nextIdx >= this.Chunks.Count then
+                                        this.growChunksArray nextIdx
+                                    
+                                    // Allocate in the new chunk
+                                    this.allocateInNextChunk baseId str
+                                finally
+                                    this.ChunksLock.ExitWriteLock()
+                            else
+                                // Write lock acquisition failed - emergency allocation
+                                this.EmergencyAllocate str
+                else 
+                    this.EmergencyAllocate str
             finally
                 // Always release locks in correct order
-                if writeLockHeld then 
-                        this.ChunksLock.ExitWriteLock()
                 if readLockHeld then this.ChunksLock.ExitUpgradeableReadLock()
-       
+
+        member this.GetAdaptiveThreshold() : int32 =
+            let count = Volatile.Read(&this.StringCount)  // Uses the count we're tracking
+            let scaleFactor = 
+                1.0 + 
+                (float count / float this.Configuration.ThresholdScalingInterval) * 
+                (this.Configuration.ThresholdScalingFactor - 1.0)
+            int32 (float this.PromotionThreshold * scaleFactor)
+
         member private this.EmergencyAllocate(str: string) : StringId =
             // Guaranteed to succeed even under extreme contention
             let emergencyId = Interlocked.Increment(&this.EmergencyCounter) - 1
             this.EmergencyCache.TryAdd(emergencyId, str) |> ignore
             
-            // Also track temperature for emergency allocations
-            this.StringTemperatures.AddOrUpdate(str, 1, fun _ oldTemp -> 
-                let newTemp = oldTemp + 1
-                // Signal promotion if temperature crosses threshold
-                if newTemp = this.PromotionThreshold then
-                    Interlocked.Increment(&this.PromotionSignalCount) |> ignore
-                newTemp) |> ignore
-                
-            StringId(this.EmergencyBaseId + emergencyId)
+            Interlocked.Increment(&this.StringCount) |> ignore
+            StringId.Create(this.EmergencyBaseId + emergencyId)
         
         member this.TryGetString(id: int, baseId: int) : string option =
             // Check if it's an emergency ID
@@ -554,45 +595,6 @@ module StringInterning =
                     else None
                 else None
         
-        // Apply temperature decay
-        member this.DecayTemperatures(decayFactor: float) =
-            // Update each string's temperature individually with atomic operations
-            let keysToRemove = ResizeArray<string>()
-            
-            for kvp in this.StringTemperatures do
-                let str = kvp.Key
-                let currentTemp = kvp.Value
-                let newTemp = int32 (float currentTemp * decayFactor)
-                
-                if newTemp > 0 then
-                    // Update to new decayed temperature
-                    this.StringTemperatures.TryUpdate(str, newTemp, currentTemp) |> ignore
-                else
-                    // Temperature decayed to zero, mark for removal
-                    keysToRemove.Add(str)
-            
-            // Remove entries with zero temperature
-            for str in keysToRemove do
-                let mutable temp = 0
-                this.StringTemperatures.TryRemove(str, &temp) |> ignore
-                
-            this.LastDecayTime <- DateTime.UtcNow
-        
-        // Check if time for decay and apply if needed
-        member this.CheckAndDecayTemperatures() =
-            let now = DateTime.UtcNow
-            if (now - this.LastDecayTime) > this.Configuration.DecayInterval then
-                this.DecayTemperatures(this.Configuration.TemperatureDecayFactor)
-        
-        // Get current promotion threshold, adjusted for pool size
-        member this.GetAdjustedPromotionThreshold() =
-            let stringCount = this.StringTemperatures.Count
-            let scalingFactor = 
-                1.0 + 
-                (float stringCount / float this.Configuration.ThresholdScalingInterval) * 
-                (this.Configuration.ThresholdScalingFactor - 1.0)
-            int (float this.PromotionThreshold * scalingFactor)
-        
         // Get batch of promotion candidates
         member this.GetPromotionCandidates(maxBatchSize: int) : PromotionCandidate[] =
             // Threshold with scaling applied
@@ -604,10 +606,6 @@ module StringInterning =
             |> Seq.truncate maxBatchSize
             |> Seq.map (fun kvp -> { Value = kvp.Key; Temperature = kvp.Value })
             |> Seq.toArray
-        
-        // Reset temperature for a promoted string
-        member this.ResetTemperature(str: string) =
-            this.StringTemperatures.AddOrUpdate(str, 0, fun _ _ -> 0) |> ignore
         
         // Check for strings to promote and return candidates if appropriate
         member this.CheckPromotion() : PromotionCandidate[] =
@@ -686,11 +684,15 @@ module StringInterning =
         mutable LastDecayTime: DateTime
         mutable LastPromotionTime: int64
         mutable PromotionSignalCount: int64
+
+        EdenPromotionTracker: EpochPromotionTracker
         
         // Stats
         mutable Stats: Stats
     } with
         static member Create(baseId: int, edenSize: int, config: PoolConfiguration) =
+            let rotationInterval = 
+                TimeSpan.FromMilliseconds(config.MinPromotionInterval.TotalMilliseconds / 3.0)
             {
                 EdenArray = Array.zeroCreate edenSize
                 EdenOffset = 0
@@ -701,44 +703,12 @@ module StringInterning =
                 LastDecayTime = DateTime.UtcNow
                 LastPromotionTime = 0L
                 PromotionSignalCount = 0L
+                EdenPromotionTracker = EpochPromotionTracker.Create(
+                    queueSizeBits = 14,  // 16K signals for Eden space
+                    rotationInterval = rotationInterval
+                )
                 Stats = { accessCount = 0L; missCount = 0L }
             }
-        
-        // Decay temperatures in this pool
-        member this.DecayTemperatures(decayFactor: float) =
-            // Decay eden temperatures
-            let keysToRemove = ResizeArray<string>()
-            
-            for kvp in this.EdenTemperatures do
-                let str = kvp.Key
-                let currentTemp = kvp.Value
-                let newTemp = int32 (float currentTemp * decayFactor)
-                
-                if newTemp > 0 then
-                    // Update to new decayed temperature
-                    this.EdenTemperatures.TryUpdate(str, newTemp, currentTemp) |> ignore
-                else
-                    // Temperature decayed to zero, mark for removal
-                    keysToRemove.Add(str)
-            
-            // Remove entries with zero temperature
-            for str in keysToRemove do
-                let mutable temp = 0
-                this.EdenTemperatures.TryRemove(str, &temp) |> ignore
-            
-            // Decay post-eden segments
-            this.PostEden.DecayTemperatures(decayFactor)
-            this.LastDecayTime <- DateTime.UtcNow
-        
-        // Check if time for decay and apply if needed
-        member this.CheckAndDecayTemperatures() =
-            let now = DateTime.UtcNow
-            if (now - this.LastDecayTime) > this.Configuration.DecayInterval then
-                this.DecayTemperatures(this.Configuration.TemperatureDecayFactor)
-                this.LastDecayTime <- now
-            
-            // Also check post-eden segments
-            this.PostEden.CheckAndDecayTemperatures()
         
         // Get current promotion threshold for eden space, adjusted for size
         member this.GetAdjustedEdenPromotionThreshold() =
@@ -773,59 +743,28 @@ module StringInterning =
         
         // Check both eden and post-eden spaces for promotion candidates
         member this.CheckPromotion() : PromotionCandidate[] =
-            // Combine eden space and post-eden promotion checks
-            
-            // Fast check for any promotion signals (completely lock-free)
-            let signalCount = 
-                Interlocked.Read(&this.PromotionSignalCount) + 
-                Interlocked.Read(&this.PostEden.PromotionSignalCount)
-                
-            if signalCount > 0L then
-                // Check if enough time has passed since last promotion
-                let now = Stopwatch.GetTimestamp()
-                let elapsed = now - Volatile.Read(&this.LastPromotionTime)
-                let minInterval = 
-                    this.Configuration.MinPromotionInterval.TotalMilliseconds * 
-                    float Stopwatch.Frequency / 1000.0
-                    
-                if float elapsed > minInterval then
-                    // Try to claim promotion by atomically updating timestamp
-                    if Interlocked.CompareExchange(&this.LastPromotionTime, now, 
-                                                    Volatile.Read(&this.LastPromotionTime)) <> now then
-                        // We won the race to do promotion
-                        let halfBatch = this.Configuration.MaxPromotionBatchSize / 2
-                        
-                        // Get candidates from both spaces
-                        let edenCandidates = this.GetEdenPromotionCandidates(halfBatch)
-                        let postEdenCandidates = this.PostEden.CheckPromotion()
-                        
-                        // Combine and limit to max batch size
-                        let allCandidates = 
-                            Array.append edenCandidates postEdenCandidates
-                            |> Array.truncate this.Configuration.MaxPromotionBatchSize
-                        
-                        if edenCandidates.Length > 0 then
-                            // Update signal count atomically
-                            Interlocked.Add(&this.PromotionSignalCount, -int64 edenCandidates.Length) |> ignore
-                        
-                        allCandidates
-                    else
-                        // Another thread is handling promotion
-                        [||]
+            // Process both Eden and PostEden promotions
+            let edenResolver (id: StringId) =
+                let idValue = id.Value
+                let relativeId = idValue - this.PoolBaseId
+                if relativeId >= 0 && relativeId < this.EdenArray.Length then
+                    let str = Volatile.Read &this.EdenArray.[relativeId]
+                    if not (isNull str) then Some str else None
                 else
-                    // Not enough time elapsed since last promotion
-                    [||]
-            else
-                // No promotion needed
-                [||]
+                    None
+            
+            let edenCandidates = this.EdenPromotionTracker.ProcessPromotions edenResolver
+            
+            // Pass the correct baseId for PostEden
+            let postEdenBaseId = this.PoolBaseId + this.EdenArray.Length
+            let postEdenCandidates = this.PostEden.ProcessPromotions(postEdenBaseId)
+            
+            Array.append edenCandidates postEdenCandidates
         
         member this.InternString(str: string) : StringId =
             if isNull str || str.Length = 0 then
                 raise (ArgumentException "String cannot be null or empty")
-            
-            // Check if it's time to decay temperatures
-            this.CheckAndDecayTemperatures()
-            
+                        
             // Opportunistically check for promotion
             this.CheckPromotion() |> ignore
             
@@ -835,7 +774,7 @@ module StringInterning =
             let edenIdx = Interlocked.Increment(&this.EdenOffset) - 1
             if edenIdx < this.EdenArray.Length then
                 // Eden has space
-                let id = StringId(this.PoolBaseId + edenIdx)
+                let id = StringId.Create(this.PoolBaseId + edenIdx)
                 Volatile.Write(&this.EdenArray.[edenIdx], str)
                 
                 // Update temperature with atomic operation
@@ -868,6 +807,43 @@ module StringInterning =
                 else
                     // In post-eden segments
                     this.PostEden.TryGetString(idValue, this.PoolBaseId + this.EdenArray.Length)
+        
+        member this.GetStringWithTemperature(id: StringId) : (string option * StringId) =
+            let idValue = id.Value
+            if idValue < this.PoolBaseId then
+                None, id
+            else
+                let relativeId = idValue - this.PoolBaseId
+                if relativeId < this.EdenArray.Length then
+                    // In eden space
+                    let str = Volatile.Read(&this.EdenArray.[relativeId])
+                    if not (isNull str) then 
+                        let newId = id.IncrementTemperature()
+                        
+                        // Check for promotion threshold
+                        let threshold = this.GetAdjustedEdenPromotionThreshold()
+                        if newId.Temperature = threshold then
+                            // Pass id, str, and temperature
+                            this.EdenPromotionTracker.SignalPromotion(newId, newId.Temperature) |> ignore
+                        
+                        Some str, newId
+                    else 
+                        None, id
+                else
+                    // In post-eden segments
+                    match this.PostEden.TryGetString(idValue, this.PoolBaseId + this.EdenArray.Length) with
+                    | Some str ->
+                        let newId = id.IncrementTemperature()
+                        
+                        // Check for promotion threshold
+                        let threshold = this.PostEden.GetAdaptiveThreshold()
+                        if newId.Temperature = threshold then
+                            // Pass id, str, and temperature
+                            this.PostEden.PromotionTracker.SignalPromotion(newId, newId.Temperature) |> ignore
+                        
+                        Some str, newId
+                    | None ->
+                        None, id
         
         member this.GetStats() : PoolStats =
             let edenMemory = 
@@ -941,7 +917,7 @@ module StringInterning =
                 MaxTemperature = combinedMaxTemp
                 HotStringsCount = edenHotCount + segHotCount
                 PendingPromotions = pendingPromotions
-            } *)
+            }
 
     type GlobalPool = {
         // Immutable planning strings
@@ -979,20 +955,26 @@ module StringInterning =
                 // Planning string - direct array access
                 Some this.PlanningArray.[id.Value]
             elif id.Value < IdAllocation.GlobalRuntimeBase then
-                // Runtime string
+                // Runtime string - no temperature update at this level
                 this.RuntimePool.TryGetString(id)
             else
-                // Not a global ID!
+                // Not a global ID
                 None
+
+        member this.GetStringWithTemperature(id: StringId) : (string option * StringId) =
+            if id.Value < this.PlanningCount then
+                // Planning strings don't need temperature tracking
+                Some this.PlanningArray.[id.Value], id
+            elif id.Value < IdAllocation.GlobalRuntimeBase then
+                // Delegate to runtime pool for temperature tracking
+                this.RuntimePool.GetStringWithTemperature(id)
+            else
+                // Not a global ID
+                None, id
         
         // Check promotion queue in runtime pool
         member this.CheckPromotion() : PromotionCandidate[] =
             this.RuntimePool.CheckPromotion()
-        
-        // Decay temperatures in runtime pool
-        member this.DecayTemperatures(decayFactor: float) =
-            // Only decay runtime pool - planning strings don't have temperature
-            this.RuntimePool.DecayTemperatures(decayFactor)
         
         member this.GetStats() : PoolStats = 
             let planningMemory = 
@@ -1060,11 +1042,12 @@ module StringInterning =
                 Interlocked.Increment(&this.Stats.missCount) |> ignore
                 this.GroupPool.InternString(str)
         
+        // In GroupPool
         member this.GetString(id: StringId) : string option =
             // Check if it's in our group's range
             if id.Value >= this.GroupPoolBaseId && 
                 id.Value < this.GroupPoolBaseId + IdAllocation.GroupPoolRangeSize then
-                // It's a group ID
+                // It's a group ID - no temperature update at this level
                 this.GroupPool.TryGetString(id)
             else
                 // Check cross-tier cache first
@@ -1078,12 +1061,25 @@ module StringInterning =
                         else
                             None  // Would be another group or local pool
                     
-                    // Cache the result if found - we don't care about misses at this stage
+                    // Cache the result if found
                     match result with
                     | Some str -> 
                         this.CrossTierCache.TryAdd(id, str) |> ignore
                         Some str
                     | None -> None
+
+        member this.GetStringWithTemperature(id: StringId) : (string option * StringId) =
+            // Check if it's in our group's range
+            if id.Value >= this.GroupPoolBaseId && 
+                id.Value < this.GroupPoolBaseId + IdAllocation.GroupPoolRangeSize then
+                // Delegate to group pool for temperature tracking
+                this.GroupPool.GetStringWithTemperature(id)
+            else
+                // For cross-tier access, we don't update temperature
+                // (temperature is owned by the tier that allocated the string)
+                match this.GetString(id) with
+                | Some str -> Some str, id
+                | None -> None, id
         
         // Process promotion in group pool and promote to global
         member this.CheckPromotion() : unit =
@@ -1097,9 +1093,6 @@ module StringInterning =
                 // Reset temperature in group pool
                 this.GroupPool.ResetEdenTemperature(candidate.Value)
                 this.GroupPool.PostEden.ResetTemperature(candidate.Value)
-        
-        member this.DecayTemperatures(decayFactor: float) =
-            this.GroupPool.DecayTemperatures(decayFactor)
         
         member this.GetStats() : PoolStats = 
             let groupStats = this.GroupPool.GetStats()
@@ -1147,7 +1140,7 @@ module StringInterning =
         
         // Temperature tracking - no thread-safety needed for local pool
         mutable StringTemperatures: FastMap<string, int32>
-        mutable HotStrings: HashSet<string>
+        mutable HotStrings: FSharp.HashCollections.HashSet<string>
         mutable LastDecayTime: DateTime
         mutable LastPromotionTime: int64
         mutable PromotionSignalCount: int64
@@ -1161,12 +1154,6 @@ module StringInterning =
             if isNull str || str.Length = 0 then
                 raise (ArgumentException "String cannot be null or empty")
 
-            // Check if it's time to decay temperatures
-            let now = DateTime.UtcNow
-            if (now - this.LastDecayTime) > this.Configuration.DecayInterval then
-                this.DecayTemperatures(this.Configuration.TemperatureDecayFactor)
-                this.LastDecayTime <- now
-                
             // Opportunistically check for promotion
             this.CheckPromotion()
 
@@ -1241,7 +1228,38 @@ module StringInterning =
                         match this.GroupPool with
                         | Some pool -> pool.GetString id
                         | None -> this.GlobalPool.GetString id
-        
+
+        member this.GetStringWithTemperature(id: StringId) : (string option * StringId) =
+            if id.Value >= this.LocalPoolBaseId && 
+                id.Value < this.LocalPoolBaseId + IdAllocation.WorkerRangeSize then
+                // Local string
+                let localIndex = id.Value - this.LocalPoolBaseId
+                if localIndex >= 0 && localIndex < this.LocalArray.Length then
+                    let str = this.LocalArray.[localIndex]
+                    if not (isNull str) then
+                        let newId = id.IncrementTemperature()
+                        
+                        // Check for promotion
+                        let threshold = this.GetAdjustedPromotionThreshold()
+                        if newId.Temperature = threshold then
+                            // In local pool, we track promotion candidates differently
+                            this.HotStrings <- HashSet.add str this.HotStrings
+                            this.PromotionSignalCount <- this.PromotionSignalCount + 1L
+                        
+                        Some str, newId
+                    else
+                        None, id
+                else
+                    None, id
+            else
+                // Delegate to appropriate pool
+                if id.Value < IdAllocation.GroupPoolBase then
+                    this.GlobalPool.GetStringWithTemperature id
+                else
+                    match this.GroupPool with
+                    | Some pool -> pool.GetStringWithTemperature id
+                    | None -> this.GlobalPool.GetStringWithTemperature id
+
         // Get adjusted promotion threshold based on pool size
         member this.GetAdjustedPromotionThreshold() =
             let stringCount = FastMap.count this.LocalStrings
@@ -1627,28 +1645,8 @@ module StringInterning =
                 groupPool.CheckPromotion()
                 
             // The local pools self-manage their promotion
-            // during normal operations, so we don't need to iterate them here
-            
-            globalCandidates.Length + totalPromoted
-        
-        // Apply temperature decay across all pools
-        member this.DecayTemperatures(decayFactor: float) =
-            // Decay global pool
-            this.GlobalPool.DecayTemperatures(decayFactor)
-            
-            // Decay group pools
-            for kvp in this.GroupPools do
-                let groupPool = kvp.Value
-                groupPool.DecayTemperatures(decayFactor)
-            
-            // Worker pools handle their own decay during operations
-            this.LastDecayTime <- DateTime.UtcNow
-        
-        // Periodic temperature management - checks if decay is needed based on time
-        member this.CheckAndDecayTemperatures() =
-            let now = DateTime.UtcNow
-            if (now - this.LastDecayTime) > this.Configuration.DecayInterval then
-                this.DecayTemperatures(this.Configuration.TemperatureDecayFactor)
+            // during normal operations, so we don't need to iterate them here            
+            globalCandidates.Length + totalPromoted        
 
     type PoolContextScope(context: ExecutionContext) =
         member __.Context = context
@@ -1677,7 +1675,7 @@ module StringInterning =
 
     [<RequireQualifiedAccess>]
     module StringPool =
-    
+
         /// Initialize the string pool hierarchy with known planning-time strings
         let create (planningStrings: string[]) : StringPoolHierarchy =
             StringPoolHierarchy.Create planningStrings
@@ -1712,15 +1710,7 @@ module StringInterning =
         /// Check and promote hot strings across the hierarchy
         let checkAndPromoteHotStrings (hierarchy: StringPoolHierarchy) : int =
             hierarchy.CheckAndPromoteHotStrings()
-        
-        /// Decay temperatures across all pools
-        let decayTemperatures (hierarchy: StringPoolHierarchy) (decayFactor: float) : unit =
-            hierarchy.DecayTemperatures(decayFactor)
-        
-        /// Check if decay is needed based on time and apply if necessary
-        let checkAndDecayTemperatures (hierarchy: StringPoolHierarchy) : unit =
-            hierarchy.CheckAndDecayTemperatures()
-        
+                
         /// Calculate optimal configuration based on RML complexity (for integration with Planner)
         let calculateOptimalConfig (totalComplexity: int) (maxPathDepth: int) (avgPredicatesPerMap: float) : PoolConfiguration =
             let baseConfig = 

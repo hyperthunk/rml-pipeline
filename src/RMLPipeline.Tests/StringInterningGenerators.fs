@@ -1,5 +1,7 @@
 namespace RMLPipeline.Tests
 
+open RMLPipeline.Core
+open RMLPipeline.Internal.StringPooling
 open System
 open System.Threading
 open System.Collections.Generic
@@ -7,7 +9,6 @@ open System.Collections.Concurrent
 open System.Diagnostics
 open FsCheck
 open Expecto
-open RMLPipeline.Internal.StringInterning
 open FSharp.HashCollections
 
 /// Generators and arbitraries for testing string interning components
@@ -63,6 +64,7 @@ module StringInterningGenerators =
             // Common strings seen in RML mappings
             Gen.constant "http://example.org/resource"
             Gen.constant "$.people[*]"
+            Gen.constant "$.transactions[*].lineItems[*]"
             Gen.constant "http://xmlns.com/foaf/0.1/name"
             Gen.constant "{id}"
             Gen.constant "name"
@@ -70,19 +72,19 @@ module StringInterningGenerators =
     
     // StringId generator
     let genValidStringId =
-        Gen.choose(0, 1000000)
-        |> Gen.map StringId
+        Gen.choose(0, 10000000)
+        |> Gen.map StringId.Create
         
     let genInvalidStringId =
         Gen.elements [-1; -42; Int32.MinValue]
-        |> Gen.map StringId
-    
+        |> Gen.map StringId.Create
+
     // Configuration generators
     let genEdenSize = Gen.choose(50, 10000)
     let genChunkSize = Gen.choose(10, 5000)
     let genPromotionThreshold = Gen.choose(5, 100)
     
-    let genPoolConfiguration =
+    let genPoolConfiguration : Gen<PoolConfiguration> =
         gen {
             let! globalEdenSize = genEdenSize
             let! groupEdenSize = genEdenSize |> Gen.map (fun s -> s / 2)
@@ -173,12 +175,18 @@ module StringInterningGenerators =
         }
     
     // FSCheck arbitraries
-    type StringPoolArbitraries =
+    type StringInterningArbitraries =
         static member TestString() = Arb.fromGen genTestString
         static member StringId() = Arb.fromGen genValidStringId
-        static member PoolConfiguration() = Arb.fromGen genPoolConfiguration
+        static member PoolConfiguration() : Arbitrary<PoolConfiguration> = 
+            { new Arbitrary<PoolConfiguration>() with
+                    member _.Generator = genPoolConfiguration
+                    member _.Shrinker _ = Seq.empty
+            }
+        
         static member StringAccessPattern() = Arb.fromGen genStringAccessPattern
         static member DependencyGroupId() = Arb.fromGen genDependencyGroupId
         static member WorkerId() = Arb.fromGen genWorkerId
         static member ConcurrentScenario() = Arb.fromGen genConcurrentScenario
         static member PromotionScenario() = Arb.fromGen genPromotionScenario
+    
