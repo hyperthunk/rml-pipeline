@@ -325,6 +325,8 @@ module StringInterningTests =
         |> Array.filter (fun s -> not (String.IsNullOrEmpty(s))) // Additional safety filter
 
     let runConcurrentTest (hierarchy: StringPoolHierarchy) (scenario: {| WorkerCount: int; GroupCount: int; OperationsPerWorker: int; AccessPattern: StringAccessPattern |}) (testStrings: string[]) : Async<ConcurrentTestResult> =
+        printfn "Running concurrent test with %d workers, %d groups, %d operations per worker, access pattern: %A" 
+            scenario.WorkerCount scenario.GroupCount scenario.OperationsPerWorker scenario.AccessPattern
         async {
             if testStrings.Length = 0 then
                 failwith "testStrings cannot be empty"
@@ -433,8 +435,7 @@ module StringInterningTests =
 
     let propertyTests = [
         testProperty "String identity consistency across contexts" <| fun (strings: string[]) ->
-            // The pool has a double-check in 'TryIntern', which we want to validate here
-            // by looking for races in hierarchical pool routing logic:            
+            // We are looking for races in hierarchical pool routing logic:       
             // - Tier inconsistency: String ending up in different tiers for different contexts
             // - Routing races: Concurrent access to tier selection causing inconsistent decisions
             // - Context isolation violations: Changes in one context affecting another

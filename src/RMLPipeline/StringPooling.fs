@@ -130,6 +130,7 @@ module StringPooling =
     type PromotionCandidate = {
         Value: string
         Temperature: int32
+        OriginalId: StringId
     }
 
     (*
@@ -255,13 +256,14 @@ module StringPooling =
                 false
         
         // Process promotions - called periodically by promotion processing thread
+        // NOTE: DO NOT CALL this method from any thread that is consuming the pool!
         member this.ProcessPromotions(resolver: StringId -> string option) : PromotionCandidate[] =
             // First check if we should rotate
             if this.CheckRotation() then
                 Interlocked.Increment(&this.CurrentWriteEpoch) |> ignore
             
             // Only one thread should process at a time
-            if Monitor.TryEnter(this.ProcessingLock) then
+            if Monitor.TryEnter this.ProcessingLock then
                 try
                     // Process the oldest epoch (2 rotations ago)
                     let currentEpoch = Volatile.Read(&this.CurrentWriteEpoch)
@@ -270,23 +272,28 @@ module StringPooling =
                     
                     // Drain the entire queue
                     let mutable candidates = ResizeArray<PromotionCandidate>()
-                    let mutable batch = queue.TryDequeueBatch(1000)
+                    let mutable batch = queue.TryDequeueBatch 1000
                     
                     while batch.Length > 0 do
                         for signal in batch do
                             match resolver signal.StringId with
                             | Some str ->
-                                candidates.Add({ Value = str; Temperature = signal.Temperature })
+                                candidates.Add 
+                                    { 
+                                        Value = str
+                                        Temperature = signal.Temperature 
+                                        OriginalId = signal.StringId
+                                    }
                             | None -> ()
                         
-                        batch <- queue.TryDequeueBatch(1000)
+                        batch <- queue.TryDequeueBatch 1000
                     
                     // Deduplicate candidates
                     candidates
                     |> Seq.distinctBy (fun c -> c.Value)
                     |> Seq.toArray
                 finally
-                    Monitor.Exit(this.ProcessingLock)
+                    Monitor.Exit this.ProcessingLock
             else
                 [||]  // Another thread is processing
 
@@ -321,7 +328,46 @@ module StringPooling =
             queue.TryDequeueBatch(Int32.MaxValue)
             |> Array.choose (fun signal -> 
                 resolver signal.StringId 
-                |> Option.map (fun str -> { Value = str; Temperature = signal.Temperature }))
+                |> Option.map (fun str -> 
+                    { Value = str
+                      Temperature = signal.Temperature 
+                      OriginalId = signal.StringId
+                    }))
+
+    (*
+        Packed Array that allows us to track promotions across tiers.
+
+        Since the promotion logic allows for eventual consistency,
+        we suffer one additional atomic read read to check the entry type.       
+    *)
+    type PackedPoolArray = {
+        // Each entry is either:
+        // - High bit 0: Lower 63 bits are string array index
+        // - High bit 1: Lower 63 bits are promoted StringId value (base ID only)
+        PackedEntries: int64[]
+        StringsArray: string[]
+        mutable NextStringIndex: int32
+    }
+
+    [<Struct>]
+    type PoolEntry = 
+        | Direct of string
+        | Promoted of promotedId: StringId
+
+    [<RequireQualifiedAccess>]
+    module PackedOps =
+        let inline isPromoted (packed: int64) = packed < 0L
+        
+        let inline packStringIndex (index: int32) = int64 index
+        
+        let inline packPromotedId (id: StringId) = 
+            // Store only base ID without temperature
+            0x8000000000000000L ||| int64 id.Value
+        
+        let inline unpackStringIndex (packed: int64) = int32 packed
+        
+        let inline unpackPromotedId (packed: int64) = 
+            StringId.Create(int32(packed &&& 0x7FFFFFFFFFFFFFFFL))
 
     [<Flags>]
     type StringAccessPattern =
@@ -339,10 +385,6 @@ module StringPooling =
         HitRatio: float
         AccessCount: int64
         MissCount: int64
-        AverageTemperature: float  // Average temperature across all strings
-        MaxTemperature: int32      // Highest temperature in any chunk
-        HotStringsCount: int       // Number of strings above promotion threshold
-        PendingPromotions: int64   // Signals for strings awaiting promotion
     } with 
         static member Empty = {
             TotalStrings      = 0
@@ -350,10 +392,6 @@ module StringPooling =
             HitRatio          = 0.0
             AccessCount       = 0L
             MissCount         = 0L
-            AverageTemperature = 0.0
-            MaxTemperature    = 0
-            HotStringsCount    = 0
-            PendingPromotions  = 0L
         }
 
     [<Struct>]
@@ -398,7 +436,7 @@ module StringPooling =
         Thread-safe chunked Array
     *)
     type Segments = {
-        Chunks: ResizeArray<string[]>
+        Chunks: ResizeArray<PackedPoolArray>
         ChunkSize: int
         mutable CurrentChunkIndex: int32
         mutable ChunkOffsets: int32[]  // One counter per chunk
@@ -413,8 +451,7 @@ module StringPooling =
         
         // Temperature tracking with targeted approach
         mutable LastPromotionTime: int64
-        mutable PromotionSignalCount: int64
-
+        
         PromotionTracker: EpochPromotionTracker
         mutable PromotionThreshold: int32
         mutable StringCount: int32  // Track for adaptive threshold
@@ -423,8 +460,15 @@ module StringPooling =
             let rotationInterval = 
                 // Rotate faster than promotion interval to ensure smooth processing
                 TimeSpan.FromMilliseconds(config.MinPromotionInterval.TotalMilliseconds / 3.0)
+            
+            let firstChunk = {
+                PackedEntries = Array.zeroCreate config.InitialChunkSize
+                StringsArray = Array.zeroCreate config.InitialChunkSize
+                NextStringIndex = 0
+            }
+            
             {
-                Chunks = ResizeArray<string[]>([| Array.zeroCreate config.InitialChunkSize |])
+                Chunks = ResizeArray<PackedPoolArray> [| firstChunk |]
                 ChunkSize = config.InitialChunkSize
                 CurrentChunkIndex = 0
                 ChunkOffsets = Array.zeroCreate 10 // Initial size, will grow as needed
@@ -434,7 +478,6 @@ module StringPooling =
                 EmergencyBaseId = baseId + 900000  // Reserve high range for emergency
                 Configuration = config
                 LastPromotionTime = 0L
-                PromotionSignalCount = 0L
                 PromotionTracker = EpochPromotionTracker.Create(
                     queueSizeBits = 16,  // 64K promotion signals per epoch
                     rotationInterval = rotationInterval
@@ -448,20 +491,27 @@ module StringPooling =
             }
         
         member this.AllocateString(str: string, baseId: int) : StringId =
-            // Try to use current chunk first - completely lock-free
-            let currentChunkIdx = Volatile.Read(&this.CurrentChunkIndex)
+            let currentChunkIdx = Volatile.Read &this.CurrentChunkIndex
             let offset = Interlocked.Increment(&this.ChunkOffsets.[currentChunkIdx]) - 1
             
             let newId = 
                 if offset < this.ChunkSize then
+                    let chunk = this.Chunks.[currentChunkIdx]
+                    let stringIdx = Interlocked.Increment(&chunk.NextStringIndex) - 1
+                    
+                    // Store string in strings array
+                    Volatile.Write(&chunk.StringsArray.[stringIdx], str)
+                    
+                    // Pack the string index into entries array
+                    let packed = PackedOps.packStringIndex stringIdx
+                    Volatile.Write(&chunk.PackedEntries.[offset], packed)
+                    
                     let id = StringId.Create(baseId + (currentChunkIdx * this.ChunkSize) + offset)
-                    Volatile.Write(&this.Chunks.[currentChunkIdx].[offset], str)
                     id
                 else
                     this.AllocateInNewChunk(str, baseId)
             
-            // We leverage an adaptive threshold whilst tracking string allocations 
-            Interlocked.Increment(&this.StringCount) |> ignore
+            Interlocked.Increment &this.StringCount |> ignore
             newId
 
         member this.ProcessPromotions(baseId: int) : PromotionCandidate[] =
@@ -469,31 +519,29 @@ module StringPooling =
             let resolver (id: StringId) =
                 this.TryGetString(id.Value, baseId)
 
-            this.PromotionTracker.ProcessPromotions(resolver)
-
-        member inline private this.tryAcquireReadLock() =
-                this.ChunksLock.TryEnterUpgradeableReadLock(50)
-
-        member inline private this.tryAcquireWriteLock() =
-            this.ChunksLock.TryEnterWriteLock(50)
-
-        member inline private this.releaseReadLock() =
-            this.ChunksLock.ExitUpgradeableReadLock()
-
-        member inline private this.releaseWriteLock() =
-            this.ChunksLock.ExitWriteLock()
+            this.PromotionTracker.ProcessPromotions resolver
 
         member inline private this.growChunksArray nextIdx =
-            // Calculate next chunk size with growth factor
-            let nextChunkSize = 
+            // Calculate next array size (can be larger than ChunkSize)
+            let nextArraySize = 
                 if this.Chunks.Count = 1 then
-                    this.Configuration.SecondaryChunkSize
+                    // For second chunk, use secondary size or ChunkSize, whichever is larger
+                    max this.Configuration.SecondaryChunkSize this.ChunkSize
                 else
-                    int (float this.ChunkSize * this.Configuration.ChunkGrowthFactor)
-                    |> min 50000  // Cap chunk size at 50K
+                    // For subsequent chunks, grow the array size
+                    let lastChunk = this.Chunks.[this.Chunks.Count - 1]
+                    int (float lastChunk.PackedEntries.Length * this.Configuration.ChunkGrowthFactor)
+                    |> min 50000  // Cap array size at 50K
             
-            // Grow chunks array
-            this.Chunks.Add(Array.zeroCreate nextChunkSize)
+            // Create new PackedPoolArray chunk
+            let newChunk = {
+                PackedEntries = Array.zeroCreate nextArraySize
+                StringsArray = Array.zeroCreate nextArraySize
+                NextStringIndex = 0
+            }
+            
+            // Add the new chunk
+            this.Chunks.Add(newChunk)
             
             // Ensure offset array has space
             if nextIdx >= this.ChunkOffsets.Length then
@@ -504,15 +552,25 @@ module StringPooling =
 
         member inline private this.allocateInNextChunk baseId str =
             // Move to next chunk
-            let newChunkIdx = Interlocked.Increment(&this.CurrentChunkIndex)
+            let newChunkIdx = Interlocked.Increment &this.CurrentChunkIndex
             let newOffset = Interlocked.Increment(&this.ChunkOffsets.[newChunkIdx]) - 1
             
-            // Write string to new location
+            // Get the chunk
+            let chunk = this.Chunks.[newChunkIdx]
+            
+            // Allocate string in the strings array
+            let stringIdx = Interlocked.Increment(&chunk.NextStringIndex) - 1
+            Volatile.Write(&chunk.StringsArray.[stringIdx], str)
+            
+            // Pack the string index into entries array
+            let packed = PackedOps.packStringIndex stringIdx
+            Volatile.Write(&chunk.PackedEntries.[newOffset], packed)
+            
+            // Create StringId
             let id = StringId.Create(baseId + (newChunkIdx * this.ChunkSize) + newOffset)
-            Volatile.Write(&this.Chunks.[newChunkIdx].[newOffset], str)
             
             // Increment string count
-            Interlocked.Increment(&this.StringCount) |> ignore
+            Interlocked.Increment &this.StringCount |> ignore
             id
     
         member private this.AllocateInNewChunk(str: string, baseId: int) : StringId =
@@ -571,94 +629,39 @@ module StringPooling =
             let emergencyId = Interlocked.Increment(&this.EmergencyCounter) - 1
             this.EmergencyCache.TryAdd(emergencyId, str) |> ignore
             
-            Interlocked.Increment(&this.StringCount) |> ignore
+            Interlocked.Increment &this.StringCount |> ignore
             StringId.Create(this.EmergencyBaseId + emergencyId)
         
         member this.TryGetString(id: int, baseId: int) : string option =
             // Check if it's an emergency ID
             if id >= this.EmergencyBaseId then
                 let emergencyIdx = id - this.EmergencyBaseId
-                match this.EmergencyCache.TryGetValue(emergencyIdx) with
+                match this.EmergencyCache.TryGetValue emergencyIdx with
                 | true, str -> Some str
                 | false, _ -> None
             else
-                // Regular chunk lookup
+                // Regular chunk lookup with fixed ChunkSize
                 let relativeId = id - baseId
                 let chunkIdx = relativeId / this.ChunkSize
                 let offset = relativeId % this.ChunkSize
                 
                 if chunkIdx >= 0 && chunkIdx < this.Chunks.Count then
                     let chunk = this.Chunks.[chunkIdx]
-                    if offset >= 0 && offset < chunk.Length then
-                        let str = Volatile.Read(&chunk.[offset])
-                        if not (isNull str) then Some str else None
+                    if offset >= 0 && offset < chunk.PackedEntries.Length then
+                        let packed = Volatile.Read(&chunk.PackedEntries.[offset])
+                        
+                        if PackedOps.isPromoted packed then
+                            // String was promoted - return None to trigger lookup in higher tier
+                            None
+                        else
+                            let stringIdx = PackedOps.unpackStringIndex packed
+                            if stringIdx >= 0 && stringIdx < chunk.StringsArray.Length then
+                                let str = Volatile.Read &chunk.StringsArray.[stringIdx]
+                                if not (isNull str) then Some str else None
+                            else 
+                                None
                     else None
                 else None
-        
-        // Get batch of promotion candidates
-        member this.GetPromotionCandidates(maxBatchSize: int) : PromotionCandidate[] =
-            // Threshold with scaling applied
-            let threshold = this.GetAdjustedPromotionThreshold()
-            
-            // Find candidates that exceed threshold
-            this.StringTemperatures
-            |> Seq.filter (fun kvp -> kvp.Value >= threshold)
-            |> Seq.truncate maxBatchSize
-            |> Seq.map (fun kvp -> { Value = kvp.Key; Temperature = kvp.Value })
-            |> Seq.toArray
-        
-        // Check for strings to promote and return candidates if appropriate
-        member this.CheckPromotion() : PromotionCandidate[] =
-            // Fast check for any promotion signals (completely lock-free)
-            if Interlocked.Read(&this.PromotionSignalCount) > 0L then
-                // Check if enough time has passed since last promotion
-                let now = Stopwatch.GetTimestamp()
-                let elapsed = now - Volatile.Read(&this.LastPromotionTime)
-                let minInterval = 
-                    this.Configuration.MinPromotionInterval.TotalMilliseconds * 
-                    float Stopwatch.Frequency / 1000.0
-                    
-                if float elapsed > minInterval then
-                    // Try to claim promotion by atomically updating timestamp
-                    if Interlocked.CompareExchange(&this.LastPromotionTime, now, 
-                                                    Volatile.Read(&this.LastPromotionTime)) <> now then
-                        // We won the race to do promotion
-                        let candidates = this.GetPromotionCandidates(this.Configuration.MaxPromotionBatchSize)
-                        
-                        if candidates.Length > 0 then
-                            // Update signal count atomically
-                            Interlocked.Add(&this.PromotionSignalCount, -int64 candidates.Length) |> ignore
-                        
-                        candidates
-                    else
-                        // Another thread is handling promotion
-                        [||]
-                else
-                    // Not enough time elapsed since last promotion
-                    [||]
-            else
-                // No promotion needed
-                [||]
-        
-        // Get temperature statistics
-        member this.GetTemperatureStats() =
-            // Calculate statistics from the string temperatures
-            let temperatures = this.StringTemperatures.Values
-            if temperatures.Count = 0 then
-                0.0, 0, 0
-            else
-                let mutable sum = 0
-                let mutable max = 0
-                let mutable hotCount = 0
-                let threshold = this.GetAdjustedPromotionThreshold()
-                
-                for temp in temperatures do
-                    sum <- sum + temp
-                    max <- Math.Max(max, temp)
-                    if temp >= threshold then
-                        hotCount <- hotCount + 1
-                
-                float sum / float temperatures.Count, max, hotCount
         
         interface IDisposable with
             member this.Dispose() = 
@@ -667,7 +670,7 @@ module StringPooling =
     // Generational pool with eden space and chunked overflow
     type Pool = {
         // Eden space (pre-allocated fixed array)
-        EdenArray: string[]
+        EdenArray: PackedPoolArray
         mutable EdenOffset: int32
         
         // Post-eden space (chunked for growth)
@@ -679,12 +682,9 @@ module StringPooling =
         // Configuration
         Configuration: PoolConfiguration
         
-        // Temperature tracking for eden space
-        EdenTemperatures: ConcurrentDictionary<string, int32>
         mutable LastDecayTime: DateTime
         mutable LastPromotionTime: int64
-        mutable PromotionSignalCount: int64
-
+        
         EdenPromotionTracker: EpochPromotionTracker
         
         // Stats
@@ -694,15 +694,17 @@ module StringPooling =
             let rotationInterval = 
                 TimeSpan.FromMilliseconds(config.MinPromotionInterval.TotalMilliseconds / 3.0)
             {
-                EdenArray = Array.zeroCreate edenSize
+                EdenArray = {
+                    PackedEntries = Array.zeroCreate edenSize
+                    StringsArray = Array.zeroCreate edenSize
+                    NextStringIndex = 0
+                }
                 EdenOffset = 0
                 PostEden = Segments.Create(baseId + edenSize, config)
                 PoolBaseId = baseId
                 Configuration = config
-                EdenTemperatures = ConcurrentDictionary<string, int32>()
                 LastDecayTime = DateTime.UtcNow
                 LastPromotionTime = 0L
-                PromotionSignalCount = 0L
                 EdenPromotionTracker = EpochPromotionTracker.Create(
                     queueSizeBits = 14,  // 16K signals for Eden space
                     rotationInterval = rotationInterval
@@ -711,7 +713,7 @@ module StringPooling =
             }
         
         // Get current promotion threshold for eden space, adjusted for size
-        member this.GetAdjustedEdenPromotionThreshold() =
+        (* member this.GetAdjustedEdenPromotionThreshold() =
             let stringCount = this.EdenTemperatures.Count
             let baseThreshold = 
                 if this.PoolBaseId < IdAllocation.GroupPoolBase then 
@@ -723,23 +725,7 @@ module StringPooling =
                 1.0 + 
                 (float stringCount / float this.Configuration.ThresholdScalingInterval) * 
                 (this.Configuration.ThresholdScalingFactor - 1.0)
-            int (float baseThreshold * scalingFactor)
-        
-        // Get batch of promotion candidates from eden space
-        member private this.GetEdenPromotionCandidates(maxBatchSize: int) : PromotionCandidate[] =
-            // Threshold with scaling applied
-            let threshold = this.GetAdjustedEdenPromotionThreshold()
-            
-            // Find candidates that exceed threshold
-            this.EdenTemperatures
-            |> Seq.filter (fun kvp -> kvp.Value >= threshold)
-            |> Seq.truncate maxBatchSize
-            |> Seq.map (fun kvp -> { Value = kvp.Key; Temperature = kvp.Value })
-            |> Seq.toArray
-        
-        // Reset temperature for a promoted string in eden space
-        member this.ResetEdenTemperature(str: string) =
-            this.EdenTemperatures.AddOrUpdate(str, 0, fun _ _ -> 0) |> ignore
+            int (float baseThreshold * scalingFactor) *)
         
         // Check both eden and post-eden spaces for promotion candidates
         member this.CheckPromotion() : PromotionCandidate[] =
@@ -747,16 +733,34 @@ module StringPooling =
             let edenResolver (id: StringId) =
                 let idValue = id.Value
                 let relativeId = idValue - this.PoolBaseId
-                if relativeId >= 0 && relativeId < this.EdenArray.Length then
-                    let str = Volatile.Read &this.EdenArray.[relativeId]
-                    if not (isNull str) then Some str else None
+                if relativeId >= 0 && relativeId < this.EdenArray.PackedEntries.Length then
+                    let packed = Volatile.Read(&this.EdenArray.PackedEntries.[relativeId])
+                    
+                    if PackedOps.isPromoted packed then
+                        // Already promoted - shouldn't happen in promotion queue
+                        None
+                    else
+                        let stringIdx = PackedOps.unpackStringIndex packed
+                        let str = Volatile.Read(&this.EdenArray.StringsArray.[stringIdx])
+                        if not (isNull str) then 
+                            // Return candidate with original ID
+                            Some { Value = str; Temperature = id.Temperature; OriginalId = id }
+                        else 
+                            None
                 else
                     None
             
-            let edenCandidates = this.EdenPromotionTracker.ProcessPromotions edenResolver
+            let edenCandidates = 
+                this.EdenPromotionTracker.ProcessPromotions(fun id ->
+                    match edenResolver id with
+                    | Some candidate -> Some candidate.Value
+                    | None -> None
+                )
             
-            // Pass the correct baseId for PostEden
-            let postEdenBaseId = this.PoolBaseId + this.EdenArray.Length
+            // Need to modify ProcessPromotions to return PromotionCandidate with OriginalId
+            // Or track the original IDs separately...
+            
+            let postEdenBaseId = this.PoolBaseId + this.EdenArray.PackedEntries.Length
             let postEdenCandidates = this.PostEden.ProcessPromotions(postEdenBaseId)
             
             Array.append edenCandidates postEdenCandidates
@@ -764,35 +768,29 @@ module StringPooling =
         member this.InternString(str: string) : StringId =
             if isNull str || str.Length = 0 then
                 raise (ArgumentException "String cannot be null or empty")
-                        
+                            
             // Opportunistically check for promotion
             this.CheckPromotion() |> ignore
             
             Interlocked.Increment(&this.Stats.accessCount) |> ignore
             
-            // Try eden space first
             let edenIdx = Interlocked.Increment(&this.EdenOffset) - 1
-            if edenIdx < this.EdenArray.Length then
-                // Eden has space
-                let id = StringId.Create(this.PoolBaseId + edenIdx)
-                Volatile.Write(&this.EdenArray.[edenIdx], str)
+            if edenIdx < this.EdenArray.PackedEntries.Length then
+                let stringIdx = Interlocked.Increment(&this.EdenArray.NextStringIndex) - 1
                 
-                // Update temperature with atomic operation
-                this.EdenTemperatures.AddOrUpdate(str, 1, fun _ oldTemp -> 
-                    let newTemp = oldTemp + 1
-                    
-                    // Signal promotion if temperature crosses threshold
-                    let threshold = this.GetAdjustedEdenPromotionThreshold()
-                    if newTemp = threshold then
-                        Interlocked.Increment(&this.PromotionSignalCount) |> ignore
-                        
-                    newTemp) |> ignore
-                    
-                Interlocked.Increment(&this.Stats.missCount) |> ignore
+                // Store string
+                Volatile.Write(&this.EdenArray.StringsArray.[stringIdx], str)
+                
+                // Pack the string index
+                let packed = PackedOps.packStringIndex stringIdx
+                Volatile.Write(&this.EdenArray.PackedEntries.[edenIdx], packed)
+                
+                let id = StringId.Create(this.PoolBaseId + edenIdx)
+                Interlocked.Increment &this.Stats.missCount |> ignore
                 id
             else
                 // Eden full, use post-eden segments
-                this.PostEden.AllocateString(str, this.PoolBaseId + this.EdenArray.Length)
+                this.PostEden.AllocateString(str, this.PoolBaseId + this.EdenArray.PackedEntries.Length)
         
         member this.TryGetString(id: StringId) : string option =
             let idValue = id.Value
@@ -800,13 +798,19 @@ module StringPooling =
                 None
             else
                 let relativeId = idValue - this.PoolBaseId
-                if relativeId < this.EdenArray.Length then
-                    // In eden space
-                    let str = Volatile.Read(&this.EdenArray.[relativeId])
-                    if not (isNull str) then Some str else None
+                if relativeId < this.EdenArray.PackedEntries.Length then
+                    let packed = Volatile.Read(&this.EdenArray.PackedEntries.[relativeId])
+                    
+                    if PackedOps.isPromoted packed then
+                        // String was promoted - caller should check higher tier
+                        None
+                    else
+                        let stringIdx = PackedOps.unpackStringIndex packed
+                        let str = Volatile.Read(&this.EdenArray.StringsArray.[stringIdx])
+                        if not (isNull str) then Some str else None
                 else
                     // In post-eden segments
-                    this.PostEden.TryGetString(idValue, this.PoolBaseId + this.EdenArray.Length)
+                    this.PostEden.TryGetString(idValue, this.PoolBaseId + this.EdenArray.PackedEntries.Length)
         
         member this.GetStringWithTemperature(id: StringId) : (string option * StringId) =
             let idValue = id.Value
@@ -814,31 +818,42 @@ module StringPooling =
                 None, id
             else
                 let relativeId = idValue - this.PoolBaseId
-                if relativeId < this.EdenArray.Length then
-                    // In eden space
-                    let str = Volatile.Read(&this.EdenArray.[relativeId])
-                    if not (isNull str) then 
-                        let newId = id.IncrementTemperature()
-                        
-                        // Check for promotion threshold
-                        let threshold = this.GetAdjustedEdenPromotionThreshold()
-                        if newId.Temperature = threshold then
-                            // Pass id, str, and temperature
-                            this.EdenPromotionTracker.SignalPromotion(newId, newId.Temperature) |> ignore
-                        
-                        Some str, newId
-                    else 
+                if relativeId < this.EdenArray.PackedEntries.Length then
+                    let packed = Volatile.Read(&this.EdenArray.PackedEntries.[relativeId])
+                    // Check if the string is still in eden space
+                    if PackedOps.isPromoted packed then
+                        // String was promoted - caller should check higher tier
                         None, id
+                    else
+                        let stringIdx = PackedOps.unpackStringIndex packed
+                        let str = Volatile.Read(&this.EdenArray.StringsArray.[stringIdx])
+                        if not (isNull str) then 
+                            let newId = id.IncrementTemperature()
+                            
+                            // Use base threshold from configuration
+                            let threshold = 
+                                if this.PoolBaseId < IdAllocation.GroupPoolBase then 
+                                    this.Configuration.GroupPromotionThreshold 
+                                else 
+                                    this.Configuration.WorkerPromotionThreshold
+                            
+                            if newId.Temperature = threshold then
+                                this.EdenPromotionTracker.SignalPromotion(newId, newId.Temperature) |> ignore
+                            
+                            Some str, newId
+                        else 
+                            None, id
                 else
                     // In post-eden segments
-                    match this.PostEden.TryGetString(idValue, this.PoolBaseId + this.EdenArray.Length) with
+                    match this.PostEden.TryGetString(idValue, 
+                        this.PoolBaseId + this.EdenArray.PackedEntries.Length) with
                     | Some str ->
                         let newId = id.IncrementTemperature()
                         
-                        // Check for promotion threshold
-                        let threshold = this.PostEden.GetAdaptiveThreshold()
+                        // Use base threshold from PostEden
+                        let threshold = this.PostEden.PromotionThreshold
+                        
                         if newId.Temperature = threshold then
-                            // Pass id, str, and temperature
                             this.PostEden.PromotionTracker.SignalPromotion(newId, newId.Temperature) |> ignore
                         
                         Some str, newId
@@ -847,14 +862,15 @@ module StringPooling =
         
         member this.GetStats() : PoolStats =
             let edenMemory = 
-                this.EdenArray
-                |> Array.take (min this.EdenOffset this.EdenArray.Length)
+                this.EdenArray.StringsArray
+                |> Array.take (min this.EdenOffset this.EdenArray.StringsArray.Length)
                 |> Array.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2))
             
             let segmentMemory = 
                 this.PostEden.Chunks
                 |> Seq.sumBy (fun chunk ->
-                    chunk |> Array.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2)))
+                    chunk.StringsArray 
+                    |> Array.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2)))
             
             let accessCount = Interlocked.Read(&this.Stats.accessCount)
             let missCount = Interlocked.Read(&this.Stats.missCount)
@@ -863,49 +879,6 @@ module StringPooling =
                     float (accessCount - missCount) / float accessCount
                 else 0.0
             
-            // Get temperature stats
-            let edenTemps = this.EdenTemperatures.Values
-            let edenAvgTemp = 
-                if edenTemps.Count > 0 then
-                    let mutable sum = 0
-                    for t in edenTemps do sum <- sum + t
-                    float sum / float edenTemps.Count
-                else 0.0
-                
-            let edenMaxTemp = 
-                if edenTemps.Count > 0 then
-                    let mutable max = 0
-                    for t in edenTemps do max <- Math.Max(max, t)
-                    max
-                else 0
-                
-            let threshold = this.GetAdjustedEdenPromotionThreshold()
-            let edenHotCount = 
-                if edenTemps.Count > 0 then
-                    let mutable count = 0
-                    for t in edenTemps do 
-                        if t >= threshold then count <- count + 1
-                    count
-                else 0
-            
-            let segAvgTemp, segMaxTemp, segHotCount = this.PostEden.GetTemperatureStats()
-            
-            // Calculate combined temperature stats
-            let combinedMaxTemp = max edenMaxTemp segMaxTemp
-            let edenCount = this.EdenTemperatures.Count
-            let segCount = this.PostEden.StringTemperatures.Count
-            let totalCount = edenCount + segCount
-            
-            let combinedAvgTemp = 
-                if totalCount > 0 then
-                    (edenAvgTemp * float edenCount + segAvgTemp * float segCount) / 
-                    float totalCount
-                else 0.0
-            
-            let pendingPromotions = 
-                Interlocked.Read(&this.PromotionSignalCount) + 
-                Interlocked.Read(&this.PostEden.PromotionSignalCount)
-            
             {
                 TotalStrings = this.EdenOffset + this.PostEden.CurrentChunkIndex * this.PostEden.ChunkSize +
                                 this.PostEden.ChunkOffsets.[this.PostEden.CurrentChunkIndex]
@@ -913,10 +886,6 @@ module StringPooling =
                 HitRatio = hitRatio
                 AccessCount = accessCount
                 MissCount = missCount
-                AverageTemperature = combinedAvgTemp
-                MaxTemperature = combinedMaxTemp
-                HotStringsCount = edenHotCount + segHotCount
-                PendingPromotions = pendingPromotions
             }
 
     type GlobalPool = {
@@ -998,10 +967,6 @@ module StringPooling =
                 HitRatio         = hitRatio
                 AccessCount      = accessCount + runtimeStats.AccessCount
                 MissCount        = missCount + runtimeStats.MissCount
-                AverageTemperature = runtimeStats.AverageTemperature
-                MaxTemperature   = runtimeStats.MaxTemperature
-                HotStringsCount  = runtimeStats.HotStringsCount
-                PendingPromotions = runtimeStats.PendingPromotions
             }
 
     (*
@@ -1088,11 +1053,7 @@ module StringPooling =
             // Promote candidates to global pool
             for candidate in candidates do
                 // Intern in global pool
-                let _ = this.GlobalPool.InternString candidate.Value
-                
-                // Reset temperature in group pool
-                this.GroupPool.ResetEdenTemperature(candidate.Value)
-                this.GroupPool.PostEden.ResetTemperature(candidate.Value)
+                this.GlobalPool.InternString candidate.Value |> ignore
         
         member this.GetStats() : PoolStats = 
             let groupStats = this.GroupPool.GetStats()
@@ -1112,10 +1073,6 @@ module StringPooling =
                 HitRatio         = hitRatio
                 AccessCount      = access + groupStats.AccessCount
                 MissCount        = miss + groupStats.MissCount
-                AverageTemperature = groupStats.AverageTemperature
-                MaxTemperature = groupStats.MaxTemperature
-                HotStringsCount = groupStats.HotStringsCount
-                PendingPromotions = groupStats.PendingPromotions
             }
         
     (*
@@ -1123,103 +1080,41 @@ module StringPooling =
     *)
     type LocalPool = {
         WorkerId: WorkerId
-        GroupPool: GroupPool option
         GlobalPool: GlobalPool
+        GroupPool: GroupPool option
         
-        // Fast local storage - no synchronization needed
-        mutable LocalStrings: FastMap<string, StringId>
-        mutable LocalArray: string[]
+        // Just delegate to a Pool!
+        Pool: Pool  
         
-        LocalPoolBaseId: int  // Pre-calculated base ID for this worker
-        mutable NextLocalId: int  // TODO: we should shift to int64 for atomic ops
-        mutable MaxSize: int
+        LocalPoolBaseId: int
+        Configuration: PoolConfiguration
         
-        // LRU eviction for bounded size
-        AccessOrder: LinkedList<string>  // Tracks access order by string
-        mutable StringToNode: FastMap<string, LinkedListNode<string>>  // O(1) node lookup
-        
-        // Temperature tracking - no thread-safety needed for local pool
-        mutable StringTemperatures: FastMap<string, int32>
-        mutable HotStrings: FSharp.HashCollections.HashSet<string>
-        mutable LastDecayTime: DateTime
-        mutable LastPromotionTime: int64
-        mutable PromotionSignalCount: int64
-        mutable Configuration: PoolConfiguration
-
         // Stats recording
         mutable Stats: Stats
     } with
         
         member this.InternString(str: string, pattern: StringAccessPattern) : StringId =
-            if isNull str || str.Length = 0 then
-                raise (ArgumentException "String cannot be null or empty")
-
-            // Opportunistically check for promotion
-            this.CheckPromotion()
-
-            (* 
-                We can skip the atomic ops here, as we're always in the 
-                worker's thread. The miss-count increment is handled by AddLocal. 
-            *)
-            this.Stats.accessCount <- this.Stats.accessCount + 1L
-            
             match pattern with
             | StringAccessPattern.HighFrequency ->
-                // Try local first
-                match FastMap.tryFind str this.LocalStrings with
-                | ValueSome id -> 
-                    this.UpdateLRU str
-                    
-                    // Update temperature (no thread safety needed in worker pool)
-                    let currentTemp = 
-                        match FastMap.tryFind str this.StringTemperatures with
-                        | ValueSome temp -> temp
-                        | ValueNone -> 0
-                    let newTemp = currentTemp + 1
-                    this.StringTemperatures <- FastMap.add str newTemp this.StringTemperatures
-                    
-                    // Check if this string is hot enough to promote
-                    let adjustedThreshold = this.GetAdjustedPromotionThreshold()
-                    
-                    if newTemp >= adjustedThreshold && not (HashSet.contains str this.HotStrings) then
-                        // Mark as hot and signal promotion
-                        this.HotStrings <- HashSet.add str this.HotStrings
-                        this.PromotionSignalCount <- this.PromotionSignalCount + 1L
-                    
-                    id
-                | ValueNone ->
-                    // Check if we have room
-                    if FastMap.count this.LocalStrings < this.MaxSize then
-                        this.AddLocal str
-                    else
-                        // Evict LRU and add
-                        this.EvictLRU()
-                        this.AddLocal str
-
+                // Use local pool
+                this.Pool.InternString(str)
             | StringAccessPattern.Planning ->
-                // Delegate to global pool for planning strings
-                this.GlobalPool.InternString str
-            
+                // Delegate to global
+                this.GlobalPool.InternString(str)
             | _ ->
-                // Medium/Low frequency - use group pool if available
+                // Medium/Low frequency - use group pool
                 match this.GroupPool with
-                | Some pool -> pool.InternString str
-                | None -> this.GlobalPool.InternString str
+                | Some pool -> pool.InternString(str)
+                | None -> this.GlobalPool.InternString(str)
 
         member this.GetString(id: StringId) : string option =
             // First check if it's in our local range
             if id.Value < 0 then 
                 None
             else 
-                this.Stats.accessCount <- this.Stats.accessCount + 1L
                 if id.Value >= this.LocalPoolBaseId && 
                     id.Value < this.LocalPoolBaseId + IdAllocation.WorkerRangeSize then
-                    // It's a local ID                
-                    let localIndex = id.Value - this.LocalPoolBaseId
-                    if localIndex >= 0 && localIndex < this.LocalArray.Length then
-                        Some this.LocalArray.[localIndex]
-                    else
-                        None
+                    this.Pool.TryGetString id
                 else
                     // Not local - delegate to appropriate pool
                     if id.Value < IdAllocation.GroupPoolBase then
@@ -1232,25 +1127,7 @@ module StringPooling =
         member this.GetStringWithTemperature(id: StringId) : (string option * StringId) =
             if id.Value >= this.LocalPoolBaseId && 
                 id.Value < this.LocalPoolBaseId + IdAllocation.WorkerRangeSize then
-                // Local string
-                let localIndex = id.Value - this.LocalPoolBaseId
-                if localIndex >= 0 && localIndex < this.LocalArray.Length then
-                    let str = this.LocalArray.[localIndex]
-                    if not (isNull str) then
-                        let newId = id.IncrementTemperature()
-                        
-                        // Check for promotion
-                        let threshold = this.GetAdjustedPromotionThreshold()
-                        if newId.Temperature = threshold then
-                            // In local pool, we track promotion candidates differently
-                            this.HotStrings <- HashSet.add str this.HotStrings
-                            this.PromotionSignalCount <- this.PromotionSignalCount + 1L
-                        
-                        Some str, newId
-                    else
-                        None, id
-                else
-                    None, id
+                this.Pool.GetStringWithTemperature id
             else
                 // Delegate to appropriate pool
                 if id.Value < IdAllocation.GroupPoolBase then
@@ -1260,19 +1137,22 @@ module StringPooling =
                     | Some pool -> pool.GetStringWithTemperature id
                     | None -> this.GlobalPool.GetStringWithTemperature id
 
-        // Get adjusted promotion threshold based on pool size
+        (* // Get adjusted promotion threshold based on pool size
         member this.GetAdjustedPromotionThreshold() =
             let stringCount = FastMap.count this.LocalStrings
             let scalingFactor = 
                 1.0 + 
                 (float stringCount / float this.Configuration.ThresholdScalingInterval) * 
                 (this.Configuration.ThresholdScalingFactor - 1.0)
-            int (float this.Configuration.WorkerPromotionThreshold * scalingFactor)
+            int (float this.Configuration.WorkerPromotionThreshold * scalingFactor) *)
         
         // Check for hot strings to promote
         member this.CheckPromotion() : unit =
             // Fast check for any promotion signals
-            if this.PromotionSignalCount > 0L then
+            this.Pool.CheckPromotion()
+            |> ignore
+
+            (* if this.PromotionSignalCount > 0L then
                 // Check if enough time has passed since last promotion
                 let now = Stopwatch.GetTimestamp()
                 let elapsed = now - this.LastPromotionTime
@@ -1317,141 +1197,15 @@ module StringPooling =
                                 this.HotStrings <- HashSet.remove str this.HotStrings
                         
                         // Update signal count
-                        this.PromotionSignalCount <- this.PromotionSignalCount - int64 hotStrings.Length
+                        this.PromotionSignalCount <- this.PromotionSignalCount - int64 hotStrings.Length *)
         
-        // Decay all string temperatures
-        member this.DecayTemperatures(decayFactor: float) =
-            // Create new temperature map with decayed values
-            let mutable newTemps = FastMap.empty
-            let mutable newHotStrings = HashSet.empty
-            
-            for kv in FastMap.toSeq this.StringTemperatures do
-                let struct (str, temp) = kv
-                let newTemp = int32 (float temp * decayFactor)
-                if newTemp > 0 then 
-                    newTemps <- FastMap.add str newTemp newTemps
-                    
-                    // Check if still hot
-                    let threshold = this.GetAdjustedPromotionThreshold()
-                    if newTemp >= threshold && HashSet.contains str this.HotStrings then
-                        newHotStrings <- HashSet.add str newHotStrings
-            
-            this.StringTemperatures <- newTemps
-            this.HotStrings <- newHotStrings
-            
-            // Update promotion signal count
-            this.PromotionSignalCount <- int64 (HashSet.count newHotStrings)
-            this.LastDecayTime <- DateTime.UtcNow
-
         (* NB: Because stats calls can come from another thread, we use atomic ops *)
         member this.GetStats() : PoolStats = 
-            let nextLocalId = this.NextLocalId
-            let id = max (nextLocalId - 1) 0
-            let localMemory = 
-                this.LocalArray
-                |> Array.take id
-                |> Array.sumBy (fun s -> if isNull s then 0L else int64 (s.Length * 2))
-            
-            // Calculate hit ratio for this pool - although we are single
-            // threaded here by convension, we still use atomic ops
-            let access = this.Stats.accessCount
-            let miss   = this.Stats.missCount
-            let hitRatio = 
-                if access > 0L then float (access - miss) / float access
-                else 0.0
-            
-            // Calculate temperature stats
-            let tempValues = 
-                FastMap.fold (fun acc _ temp -> temp :: acc) [] this.StringTemperatures
-            
-            let avgTemp = 
-                if List.isEmpty tempValues then 0.0
-                else float (List.sum tempValues) / float tempValues.Length
-            
-            let maxTemp = 
-                if List.isEmpty tempValues then 0
-                else List.max tempValues
-            
-            let hotStringsCount = HashSet.count this.HotStrings
-            
-            in
-            { 
-                TotalStrings     = nextLocalId + 1
-                MemoryUsageBytes = localMemory
-                HitRatio         = hitRatio
-                AccessCount      = access
-                MissCount        = miss
-                AverageTemperature = avgTemp
-                MaxTemperature = maxTemp
-                HotStringsCount = hotStringsCount
-                PendingPromotions = this.PromotionSignalCount
-            }
+            this.Pool.GetStats()
 
-        (* NB: LRU OPS are only called by one thread at a time *)
-        
-        member private this.AddLocal(str: string) : StringId =
-            let currentId = this.NextLocalId
-            let newId = StringId.Create(this.LocalPoolBaseId + this.NextLocalId)
-            
-            this.Stats.missCount <- this.Stats.missCount + 1L
-            this.NextLocalId <- this.NextLocalId + 1
-            
-            if currentId < this.LocalArray.Length then
-                this.LocalArray.[currentId] <- str
-            else
-                // Need to grow local array
-                let newSize = min (this.LocalArray.Length * 2) this.MaxSize
-                let newArray = Array.zeroCreate newSize
-                Array.Copy(this.LocalArray, newArray, this.LocalArray.Length)
-                newArray.[currentId] <- str
-                this.LocalArray <- newArray
-            
-            this.LocalStrings <- FastMap.add str newId this.LocalStrings
-            
-            // Initialize temperature
-            this.StringTemperatures <- FastMap.add str 1 this.StringTemperatures
-            
-            // LRU tracking is essential to the lock-free design
-            let node = this.AccessOrder.AddLast(str)
-            this.StringToNode <- FastMap.add str node this.StringToNode
-            newId
-        
-        member private this.UpdateLRU(str: string) : unit =
-            match FastMap.tryFind str this.StringToNode with
-            | ValueSome node ->
-                // Move to end (most recently used)
-                this.AccessOrder.Remove node
-                this.AccessOrder.AddLast node
-            | ValueNone -> 
-                // Shouldn't happen, but handle gracefully
-                let node = this.AccessOrder.AddLast str
-                this.StringToNode <- FastMap.add str node this.StringToNode
-        
-        member private this.EvictLRU() : unit =
-            if this.AccessOrder.Count > 0 then
-                // Get least recently used (first in list)
-                let lruNode = this.AccessOrder.First
-                let lruString = lruNode.Value
-                
-                // Remove from LRU tracking
-                this.AccessOrder.RemoveFirst()
-                this.StringToNode <- FastMap.remove lruString this.StringToNode
-                
-                // Remove from temperature tracking
-                this.StringTemperatures <- FastMap.remove lruString this.StringTemperatures
-                if HashSet.contains lruString this.HotStrings then
-                    this.HotStrings <- HashSet.remove lruString this.HotStrings
-
-                // Remove from storage and blank the array slot
-                match FastMap.tryFind lruString this.LocalStrings with
-                | ValueSome id ->
-                    this.LocalStrings <- FastMap.remove lruString this.LocalStrings
-                    let localIndex = id.Value - this.LocalPoolBaseId
-                    if localIndex >= 0 && localIndex < this.LocalArray.Length then
-                        this.LocalArray.[localIndex] <- Unchecked.defaultof<string>
-                | ValueNone -> ()
-
-    let createStringPoolHierarchy (planningStrings: string[]) (config: PoolConfiguration) =
+    let createStringPoolHierarchy
+            (planningStrings: string[]) 
+            (config: PoolConfiguration) =
         let ps = planningStrings 
                 |> Array.mapi (fun i str -> str, StringId i)
                 |> Array.fold (fun acc (s, id) -> FastMap.add s id acc) FastMap.empty
@@ -1488,27 +1242,20 @@ module StringPooling =
         // Create local pool for a worker with configuration
         let createLocalPool 
                 (workerId: WorkerId) 
+                (edenSize: int32)
                 (groupPool: GroupPool option) = 
             let lpBaseId = IdAllocation.getLocalPoolBaseId 
                                 (groupPool |> Option.map (fun p -> p.GroupId)) 
                                 workerId
+            let lpSize = max edenSize config.WorkerEdenSize
+            let lpPool = Pool.Create(lpBaseId, lpSize, config)
             in    
             {
                 WorkerId        = workerId
-                GroupPool       = groupPool
                 GlobalPool      = globalPool
-                LocalStrings    = FastMap.empty
-                LocalArray      = Array.create config.WorkerEdenSize Unchecked.defaultof<string>
-                NextLocalId     = 0
+                GroupPool       = groupPool
                 LocalPoolBaseId = lpBaseId
-                MaxSize         = config.WorkerEdenSize
-                AccessOrder     = LinkedList<string>()
-                StringToNode    = FastMap.empty
-                StringTemperatures = FastMap.empty
-                HotStrings      = HashSet.empty
-                LastDecayTime   = DateTime.UtcNow
-                LastPromotionTime = Stopwatch.GetTimestamp()
-                PromotionSignalCount = 0L
+                Pool            = lpPool
                 Configuration   = config
                 Stats = 
                     {
@@ -1527,27 +1274,26 @@ module StringPooling =
         GlobalPoolRef: GlobalPool
     } with
         static member Create(hierarchy: StringPoolHierarchy, 
-                                groupId: DependencyGroupId option, 
-                                maxLocalStrings: int option) =
+                             groupId: DependencyGroupId option, 
+                             maxLocalStrings: int option) =
             let workerId = WorkerId.Create()
             let groupPool = groupId |> Option.map hierarchy.GroupPoolBuilder
             let contextPool = 
-                let pool = hierarchy.WorkerPoolBuilder workerId groupPool
                 match maxLocalStrings with
-                | Some max -> { pool with MaxSize = max }
-                | None -> pool
+                | Some max -> hierarchy.WorkerPoolBuilder workerId max groupPool
+                | None -> hierarchy.WorkerPoolBuilder workerId 0 groupPool
             in
             {
-                WorkerId = workerId
-                GroupId = groupId
-                ContextPool = contextPool
+                WorkerId      = workerId
+                GroupId       = groupId
+                ContextPool   = contextPool
                 ParentPoolRef = groupPool
                 GlobalPoolRef = hierarchy.GlobalPool
             }
 
     and StringPoolHierarchy = {
         GlobalPool: GlobalPool
-        WorkerPoolBuilder: WorkerId -> GroupPool option -> LocalPool
+        WorkerPoolBuilder: WorkerId -> int32 -> GroupPool option -> LocalPool
         GroupPoolBuilder: DependencyGroupId -> GroupPool
         WorkerPools: ConcurrentDictionary<WorkerId, LocalPool>
         GroupPools: ConcurrentDictionary<DependencyGroupId, GroupPool>
@@ -1598,10 +1344,6 @@ module StringPooling =
                     HitRatio = 0.0 // Will re-calculate at the end
                     AccessCount = acc.AccessCount + stats.AccessCount
                     MissCount = acc.MissCount + stats.MissCount
-                    AverageTemperature = acc.AverageTemperature + stats.AverageTemperature
-                    MaxTemperature = max acc.MaxTemperature stats.MaxTemperature
-                    HotStringsCount = acc.HotStringsCount + stats.HotStringsCount
-                    PendingPromotions = acc.PendingPromotions + stats.PendingPromotions
                 }) PoolStats.Empty
             
             let totalAccessCount = globalStats.AccessCount + groupStats.AccessCount
@@ -1611,15 +1353,6 @@ module StringPooling =
                 if totalAccessCount > 0L then 
                     float (totalAccessCount - totalMissCount) / float totalAccessCount
                 else 0.0
-                
-            // Calculate average temperature weighted by pool size
-            let avgTemp = 
-                if groupStats.TotalStrings > 0 || globalStats.TotalStrings > 0 then
-                    (globalStats.AverageTemperature * float globalStats.TotalStrings + 
-                    groupStats.AverageTemperature * float groupStats.TotalStrings) /
-                    float (globalStats.TotalStrings + groupStats.TotalStrings)
-                else 0.0
-            
             in
             {
                 TotalStrings = globalStats.TotalStrings + groupStats.TotalStrings
@@ -1627,10 +1360,6 @@ module StringPooling =
                 HitRatio = overallHitRatio
                 AccessCount = totalAccessCount
                 MissCount = totalMissCount
-                AverageTemperature = avgTemp
-                MaxTemperature = max globalStats.MaxTemperature groupStats.MaxTemperature
-                HotStringsCount = globalStats.HotStringsCount + groupStats.HotStringsCount
-                PendingPromotions = globalStats.PendingPromotions + groupStats.PendingPromotions
             }
             
         // Check for promotion across all tiers - returns number of strings promoted

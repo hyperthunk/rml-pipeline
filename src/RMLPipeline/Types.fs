@@ -109,38 +109,31 @@ module Core =
         | _ -> None
 
     (* RML String Interning Types *)
-    
+
     [<Struct>]
-    type StringId = StringId of int64
+    type StringId = 
+        | StringId of int64
         with 
         member inline this.Value = 
             let (StringId id) = this in int32 (id &&& 0xFFFFFFFFL)
         
-        static member op_Explicit(id: StringId) = id.Value
-
+        static member MaxTemperature = 0xFFFF // 65,535 - we cap temp at 16 bits
+        
         member inline this.IsValid = this.Value >= 0
-
+        
         member inline this.Temperature = 
-            let (StringId id) = this in int32 (id >>> 32)
+            let (StringId id) = this in int32 ((id >>> 32) &&& 0xFFFFL)
         
-        /// Increment temperature by one. NB: wraps to zero if we overflow int32
-        member inline this.IncrementTemperature() : StringId =
+        member inline this.IncrementTemperature() =
             let (StringId id) = this
-            // Atomic increment of temperature bits
-            let newId = id + (1L <<< 32)
-            if int32 (newId >>> 32) < 0 then
-                // If we've overflowed, reset temperature to 1
-                // NB: to keep this inline friendly we have to repeat outselves...
-                StringId (id &&& 0xFFFFFFFFL ||| (1L <<< 32))         
+            let currentTemp = int32 ((id >>> 32) &&& 0xFFFFL)
+            if currentTemp < StringId.MaxTemperature then
+                StringId (id + (1L <<< 32))
             else
-                StringId newId
+                // Temperature saturated
+                this
         
-        member inline this.WithTemperature(temp: int32) =
-            let (StringId id) = this
-            let maskedId = id &&& 0xFFFFFFFFL
-            StringId (maskedId ||| (int64 temp <<< 32))
-        
-        static member inline Create(id: int32) : StringId = 
+        static member inline Create(id: int32) = 
             StringId (int64 id)
         
         static member Invalid = StringId -1L

@@ -125,14 +125,6 @@ module TypeLevelTests =
                     afterSecond.Temperature = int temp1 + int temp2
                 
                 testPropertyWithConfig 
-                        fsConfig  
-                        "WithTemperature preserves ID and sets exact temperature" 
-                            <| fun (id: int32, temp: int32) ->
-                    let stringId = StringId.Create id
-                    let withTemp = stringId.WithTemperature temp                    
-                    withTemp.Value = id && withTemp.Temperature = temp
-                
-                testPropertyWithConfig 
                         fsConfig 
                         "Temperature starts at zero for new StringId" <| fun (id: int32) ->
                     let stringId = StringId.Create id
@@ -145,18 +137,22 @@ module TypeLevelTests =
                 
                 testPropertyWithConfig 
                         fsConfig 
-                        "Temperature overflow wrap-around resets temp to 1" <| fun (id: int32) ->
-                    let stringId = StringId.Create(id).WithTemperature Int32.MaxValue
+                        "Temperature should not overflow MaxTemperature" <| fun (id: int32) ->
+                    let stringId = 
+                        [1 .. StringId.MaxTemperature + 1]
+                        |> List.fold (fun (acc : StringId) _ ->
+                            acc.IncrementTemperature()
+                        ) (StringId.Create id)
                     let incremented = stringId.IncrementTemperature()
 
-                    // Temperature should wrap to negative (overflow)
-                    incremented.Value = id && incremented.Temperature = 1
+                    // Temperature should not exceed max
+                    incremented.Value = id && incremented.Temperature = stringId.Temperature
             ]
 
     module PromotionTrackerProperties =
         let tests = 
             // PromotionTracker Properties
-            ftestList "PromotionTracker invariants" [
+            testList "PromotionTracker invariants" [
                 testPropertyWithConfig 
                         fsConfig
                         "Enqueued signals can be dequeued in FIFO order" 
@@ -309,7 +305,11 @@ module TypeLevelTests =
                         tracker.TryDequeueBatch 1000
                         |> Array.choose (fun s -> 
                             resolver s.StringId |> Option.map (fun str -> 
-                                { Value = str; Temperature = s.Temperature }))
+                                { 
+                                    Value = str
+                                    Temperature = s.Temperature 
+                                    OriginalId = s.StringId
+                                }))
                         |> Array.distinctBy (fun c -> c.Value)
                     
                     // Should have at most one candidate for the string
@@ -342,7 +342,7 @@ module TypeLevelTests =
     // Main test entry point
     [<Tests>]
     let allTests =
-        ftestList "StringPoolTests" [
+        testList "TypeLevelTests" [
             StringIdProperties.tests
             PromotionTrackerProperties.tests
         ]
