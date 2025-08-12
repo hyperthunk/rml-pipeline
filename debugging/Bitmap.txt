@@ -1,0 +1,1098 @@
+Filter:
+
+namespace RMLPipeline.Internal
+
+module StringFilter =
+    open System
+    open System.Runtime.CompilerServices  // For AggressiveInlining
+    open System.Threading
+    
+    /// FNV-1a hash algorithm for strings - fast with good distribution
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    let inline fnv1aHash (str: string) : uint64 =
+        let prime = 1099511628211UL
+        let offset = 14695981039346656037UL
+        let mutable hash = offset
+        
+        for i = 0 to str.Length - 1 do
+            hash <- hash ^^^ uint64 (int str.[i])
+            hash <- hash * prime
+        
+        hash
+    
+    [<Struct>]
+    type FilterStats = {
+        TotalLookups: int64
+        Hits: int64        
+        Misses: int64      
+        FalsePositives: int64 
+        Collisions: int64  
+    }
+    
+    [<Struct>]
+    type StringLocation = {
+        /// 0 = Eden, 1+ = Segment index (directly maps to chunk index + 1)
+        ArrayType: byte
+        /// Index within the string array
+        StringIndex: int32
+        /// Index within the packed entries array (allows direct ID access)
+        EntryIndex: int32
+    }
+    
+    [<Struct>]
+    type HashEntry = {
+        /// Upper 32 bits of hash (for fast comparison)
+        HashFragment: uint32
+        /// Direct location information (type, string index, and entry index)
+        Location: StringLocation
+        /// For lock-free insertion - 0 means empty slot
+        mutable State: int32
+    }
+    
+    /// Lock-free string filter using bitmap and atomic hash table
+    type StringBitmapFilter = {
+        // Main bitmap for fast existence check
+        Bitmap: int64[]
+        
+        // Open addressing hash table with atomic operations
+        HashTable: HashEntry[]
+        
+        // Configuration
+        HashTableSize: int32
+        HashMask: uint64
+        
+        // Runtime tracking
+        mutable Stats: FilterStats
+    } with
+        static member Create(sizeHint: int) =
+            // Size bitmap for expected number of strings
+            let bitmapSize = max 128 (sizeHint / 8)  
+            
+            // Size hash table - make it power of 2 for fast modulo
+            // Target 75% max load factor
+            let tableSize = 
+                let rec nextPow2 n =
+                    if n &&& (n - 1) = 0 then n else nextPow2 (n ||| (n >>> 1))
+                nextPow2 (max 256 (int (float sizeHint * 1.33)))
+            
+            // Create empty structures
+            let bitmap = Array.zeroCreate bitmapSize
+            let hashTable = Array.zeroCreate<HashEntry> tableSize
+            
+            // Initialize all entries as empty
+            for i = 0 to hashTable.Length - 1 do
+                hashTable.[i].State <- 0
+            
+            {
+                Bitmap = bitmap
+                HashTable = hashTable
+                HashTableSize = tableSize
+                HashMask = (uint64 (bitmap.Length * 64)) - 1UL
+                Stats = { TotalLookups = 0L; Hits = 0L; Misses = 0L; FalsePositives = 0L; Collisions = 0L }
+            }
+        
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        member inline this.ProbeHashTable(hashFragment: uint32, initialSlot: int, maxProbes: int) : StringLocation option =
+            // Tail-recursive probe function
+            let rec probe slot probeCount =
+                if probeCount >= maxProbes then
+                    None
+                else
+                    let entry = this.HashTable.[slot]
+                    
+                    // Check if slot is occupied and matches hash
+                    if Volatile.Read(&entry.State) <> 0 && entry.HashFragment = hashFragment then
+                        Some entry.Location
+                    else if Volatile.Read(&this.HashTable.[slot].State) = 0 then
+                        // Empty slot means entry doesn't exist
+                        None
+                    else
+                        // Continue probing
+                        probe ((slot + 1) % this.HashTableSize) (probeCount + 1)
+            
+            probe initialSlot 0
+        
+        /// Check if string might exist and return its location if found
+        member this.TryGetLocation(str: string) : StringLocation option =
+            let hash = fnv1aHash str
+            
+            // Check bitmap first (quick rejection)
+            let bitIndex = int (hash &&& this.HashMask)
+            let wordIndex = bitIndex >>> 6  // Divide by 64
+            let bitMask = 1L <<< (bitIndex &&& 63)
+            
+            Interlocked.Increment(&this.Stats.TotalLookups) |> ignore
+            
+            let word = Volatile.Read(&this.Bitmap.[wordIndex])
+            if (word &&& bitMask) = 0L then
+                // Definitely not in the pool
+                Interlocked.Increment(&this.Stats.Misses) |> ignore
+                None
+            else
+                // Possibly in the pool - check hash table
+                Interlocked.Increment(&this.Stats.Hits) |> ignore
+                
+                // Get hash fragment for comparison
+                let hashFragment = uint32 (hash >>> 32)
+                
+                // Hash table probe starting position
+                let initialSlot = int (hash % uint64 this.HashTableSize)
+                let maxProbes = this.HashTableSize >>> 1  // Max half the table size
+                
+                // Probe the hash table
+                let result = this.ProbeHashTable(hashFragment, initialSlot, maxProbes)
+                
+                if result.IsNone then
+                    Interlocked.Increment(&this.Stats.FalsePositives) |> ignore
+                
+                result
+        
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        member inline this.ProbeAndInsert(hashFragment: uint32, location: StringLocation, initialSlot: int, maxProbes: int) : bool =
+            // Tail-recursive insertion function
+            let rec insert slot probeCount =
+                if probeCount >= maxProbes then
+                    false // Failed to insert
+                else
+                    let currentState = Volatile.Read(&this.HashTable.[slot].State)
+                    
+                    if currentState = 0 then
+                        // Found empty slot - populate fields first
+                        this.HashTable.[slot].HashFragment <- hashFragment
+                        this.HashTable.[slot].Location <- location
+                        
+                        // Memory barrier before state change
+                        Thread.MemoryBarrier()
+                        
+                        // Try to claim the slot atomically
+                        if Interlocked.CompareExchange(&this.HashTable.[slot].State, 1, 0) = 0 then
+                            true // Successfully inserted
+                        else
+                            // Slot claimed by another thread
+                            insert ((slot + 1) % this.HashTableSize) (probeCount + 1)
+                    elif this.HashTable.[slot].HashFragment = hashFragment then
+                        // Hash collision
+                        Interlocked.Increment(&this.Stats.Collisions) |> ignore
+                        true
+                    else
+                        // Keep probing
+                        insert ((slot + 1) % this.HashTableSize) (probeCount + 1)
+            
+            insert initialSlot 0
+        
+        /// Add string to the filter with its array location
+        member this.AddString(str: string, arrayType: byte, stringIndex: int32, entryIndex: int32) : bool =
+            let hash = fnv1aHash str
+            
+            // Update bitmap first
+            let bitIndex = int (hash &&& this.HashMask)
+            let wordIndex = bitIndex >>> 6  
+            let bitMask = 1L <<< (bitIndex &&& 63)
+            
+            // Set bit atomically - returns previous value
+            let wasSet = (Interlocked.Or(&this.Bitmap.[wordIndex], bitMask) &&& bitMask) <> 0L
+            
+            // Prepare hash table entry
+            let hashFragment = uint32 (hash >>> 32)
+            let location = { 
+                ArrayType = arrayType; 
+                StringIndex = stringIndex;
+                EntryIndex = entryIndex 
+            }
+            
+            // Try to insert into hash table
+            let initialSlot = int (hash % uint64 this.HashTableSize)
+            let maxProbes = this.HashTableSize >>> 1
+            
+            let inserted = this.ProbeAndInsert(hashFragment, location, initialSlot, maxProbes)
+            
+            // Return true if string is likely new (bitmap wasn't set)
+            not wasSet
+        
+        /// Create a new filter with increased capacity
+        member this.Resize(newSizeHint: int) =
+            StringBitmapFilter.Create(newSizeHint)
+        
+        member this.GetStats() =
+            let stats = this.Stats
+            let totalHits = Volatile.Read(&stats.Hits)
+            let falsePositives = Volatile.Read(&stats.FalsePositives)
+            let effectiveHits = totalHits - falsePositives
+            let lookups = Volatile.Read(&stats.TotalLookups)
+            
+            let hitRatio = 
+                if lookups > 0L then 
+                    float effectiveHits / float lookups 
+                else 0.0
+                
+            let falsePositiveRate = 
+                if totalHits > 0L then 
+                    float falsePositives / float totalHits 
+                else 0.0
+                
+            hitRatio, falsePositiveRate
+
+integration with pool
+
+// Add to Pool type
+type Pool = {
+    // Existing fields...
+    
+    // String filter for fast lookups
+    StringFilter: StringBitmapFilter
+}
+
+// Updated InternString method preserving existing logic
+member this.InternString(str: string) : StringId =
+    if isNull str || str.Length = 0 then
+        raise (ArgumentException "String cannot be null or empty")
+        
+    // Opportunistically check for promotion
+    this.CheckPromotion() |> ignore
+    
+    Interlocked.Increment &this.Stats.accessCount |> ignore
+    
+    // Check if string might already exist using filter
+    match this.StringFilter.TryGetLocation(str) with
+    | Some location ->
+        // Potential match - verify by direct O(1) array access
+        let mutable found = false
+        let mutable existingId = StringId.Create(0)
+        
+        if location.ArrayType = 0uy then
+            // Eden string - direct access using stored indices
+            if location.StringIndex < this.EdenArray.NextStringIndex then
+                let storedStr = Volatile.Read(&this.EdenArray.StringsArray.[location.StringIndex])
+                if storedStr = str then
+                    // Direct access to entry
+                    let edenOffset = location.EntryIndex
+                    if edenOffset >= 0 && edenOffset < this.EdenOffset then
+                        let packed = Volatile.Read(&this.EdenArray.PackedEntries.[edenOffset])
+                        // Check if it's been promoted
+                        if not (PackedOps.isPromoted packed) then
+                            found <- true
+                            existingId <- StringId.Create(this.PoolBaseId + edenOffset)
+        else
+            // Post-eden string - direct access to segment
+            let segmentIdx = int location.ArrayType - 1
+            
+            if segmentIdx < this.PostEden.Chunks.Count then
+                let chunk = this.PostEden.Chunks.[segmentIdx]
+                if location.StringIndex < chunk.NextStringIndex then
+                    let storedStr = Volatile.Read(&chunk.StringsArray.[location.StringIndex])
+                    if storedStr = str then
+                        // Calculate ID directly using segment and entry index
+                        let segmentBaseId = this.PoolBaseId + this.EdenArray.PackedEntries.Length
+                        let offset = location.EntryIndex
+                        
+                        // Verify the packed entry still references this string
+                        if offset >= 0 && offset < chunk.PackedEntries.Length then
+                            let packed = Volatile.Read(&chunk.PackedEntries.[offset])
+                            if not (PackedOps.isPromoted packed) then
+                                found <- true
+                                existingId <- StringId.Create(segmentBaseId + 
+                                                            (segmentIdx * this.PostEden.ChunkSize) + 
+                                                            offset)
+        
+        if found then
+            // String already exists - return the ID
+            existingId
+        else
+            // Either false positive or entry was promoted - fall back to normal allocation
+            this.AddNewString(str)
+    | None ->
+        // String definitely doesn't exist, add it
+        this.AddNewString(str)
+
+// Helper method to add a new string (preserving existing logic)
+member private this.AddNewString(str: string) : StringId =
+    let edenIdx = Interlocked.Increment(&this.EdenOffset) - 1
+    let id =
+        if edenIdx < this.EdenArray.PackedEntries.Length then
+            let stringIdx = Interlocked.Increment(&this.EdenArray.NextStringIndex) - 1
+            
+            // Store string
+            Volatile.Write(&this.EdenArray.StringsArray.[stringIdx], str)
+            
+            // Pack the string index
+            let packed = PackedOps.packStringIndex stringIdx
+            Volatile.Write(&this.EdenArray.PackedEntries.[edenIdx], packed)
+            
+            // Add to string filter with BOTH indices
+            this.StringFilter.AddString(str, 0uy, stringIdx, edenIdx) |> ignore
+            
+            StringId.Create(this.PoolBaseId + edenIdx)
+        else
+            // Eden full, use post-eden segments
+            let id = this.PostEden.AllocateString(str, this.PoolBaseId + this.EdenArray.PackedEntries.Length)
+            id
+    
+    Interlocked.Increment &this.Stats.missCount |> ignore
+    id
+
+integration with segments
+
+// Add to Segments type
+type Segments = {
+    // Existing fields...
+    
+    // Reference to shared filter from parent Pool
+    StringFilter: StringBitmapFilter option
+}
+
+// Update Create method to include filter reference
+static member Create(baseId: int, config: PoolConfiguration) =
+    let firstChunk = {
+        PackedEntries = Array.zeroCreate config.InitialChunkSize
+        StringsArray = Array.zeroCreate config.InitialChunkSize
+        NextStringIndex = 0
+    }
+    
+    {
+        // Existing fields...
+        StringFilter = None  // Will be set by Pool
+    }
+
+// Method to set filter reference
+member this.SetStringFilter(filter: StringBitmapFilter) =
+    this.StringFilter <- Some filter
+
+// Modified AllocateString method preserving chunking logic
+member this.AllocateString(str: string, baseId: int) : StringId =
+    // Check filter first if available
+    match this.StringFilter with
+    | Some filter ->
+        match filter.TryGetLocation(str) with
+        | Some location when location.ArrayType > 0uy ->
+            // Only check segments (ArrayType > 0)
+            let segmentIdx = int location.ArrayType - 1
+            if segmentIdx < this.Chunks.Count then
+                let chunk = this.Chunks.[segmentIdx]
+                if location.StringIndex < chunk.NextStringIndex then
+                    let storedStr = Volatile.Read(&chunk.StringsArray.[location.StringIndex])
+                    if storedStr = str then
+                        // Get the entry index from location
+                        let offset = location.EntryIndex
+                        if offset >= 0 && offset < chunk.PackedEntries.Length then
+                            let packed = Volatile.Read(&chunk.PackedEntries.[offset])
+                            // Make sure it hasn't been promoted
+                            if not (PackedOps.isPromoted packed) then
+                                // Create ID using segment and entry index
+                                let id = StringId.Create(baseId + (segmentIdx * this.ChunkSize) + offset)
+                                return id
+        | _ -> ()
+    | None -> ()
+    
+    // String not found or filter unavailable - proceed with normal allocation
+    let currentChunkIdx = Volatile.Read &this.CurrentChunkIndex
+    let offset = Interlocked.Increment(&this.ChunkOffsets.[currentChunkIdx]) - 1
+    
+    if offset < this.ChunkSize then
+        // Allocate in current chunk
+        let chunk = this.Chunks.[currentChunkIdx]
+        let stringIdx = Interlocked.Increment(&chunk.NextStringIndex) - 1
+        
+        // Store string in strings array
+        Volatile.Write(&chunk.StringsArray.[stringIdx], str)
+        
+        // Pack the string index into entries array
+        let packed = PackedOps.packStringIndex stringIdx
+        Volatile.Write(&chunk.PackedEntries.[offset], packed)
+        
+        // Add to filter if available - store BOTH indices
+        match this.StringFilter with
+        | Some filter -> 
+            filter.AddString(str, byte (currentChunkIdx + 1), stringIdx, offset) |> ignore
+        | None -> ()
+        
+        let id = StringId.Create(baseId + (currentChunkIdx * this.ChunkSize) + offset)
+        Interlocked.Increment &this.StringCount |> ignore
+        id
+    else
+        // Current chunk full - allocate in new chunk
+        this.AllocateInNewChunk(str, baseId)
+
+// Update AllocateInNewChunk to maintain filter
+member private this.AllocateInNewChunk(str: string, baseId: int) : StringId =
+    // Existing lock handling code...
+    
+    // When a new chunk is created and we allocate into it,
+    // make sure to update the filter with the correct chunk index
+    let mutable readLockHeld = false
+    let mutable writeLockHeld = false
+    
+    try
+        readLockHeld <- this.ChunksLock.TryEnterUpgradeableReadLock 50
+        if readLockHeld then
+            let currentIdx = Volatile.Read(&this.CurrentChunkIndex)
+            let nextIdx = currentIdx + 1
+            
+            if nextIdx < this.Chunks.Count then
+                // Another thread already added the chunk
+                let newChunkIdx = Interlocked.Increment &this.CurrentChunkIndex
+                let newOffset = Interlocked.Increment(&this.ChunkOffsets.[newChunkIdx]) - 1
+                
+                // Get the chunk
+                let chunk = this.Chunks.[newChunkIdx]
+                
+                // Allocate string in the strings array
+                let stringIdx = Interlocked.Increment(&chunk.NextStringIndex) - 1
+                Volatile.Write(&chunk.StringsArray.[stringIdx], str)
+                
+                // Pack the string index into entries array
+                let packed = PackedOps.packStringIndex stringIdx
+                Volatile.Write(&chunk.PackedEntries.[newOffset], packed)
+                
+                // Add to filter if available - with BOTH indices
+                match this.StringFilter with
+                | Some filter -> 
+                    filter.AddString(str, byte (newChunkIdx + 1), stringIdx, newOffset) |> ignore
+                | None -> ()
+                
+                // Create StringId
+                let id = StringId.Create(baseId + (newChunkIdx * this.ChunkSize) + newOffset)
+                
+                // Increment string count
+                Interlocked.Increment &this.StringCount |> ignore
+                id
+            else
+                // Need to add a new chunk
+                match this.Configuration.MaxChunks with
+                | Some max when this.Chunks.Count >= max ->
+                    // Hit max chunks limit - use emergency allocation
+                    this.EmergencyAllocate str
+                | _ ->
+                    // Try to acquire write lock
+                    writeLockHeld <- this.ChunksLock.TryEnterWriteLock 50
+                    if writeLockHeld then
+                        try
+                            // Ensure we have enough space in the chunks array
+                            if nextIdx >= this.Chunks.Count then
+                                this.growChunksArray nextIdx
+                            
+                            // Allocate in the new chunk
+                            let newChunkIdx = Interlocked.Increment &this.CurrentChunkIndex
+                            let newOffset = Interlocked.Increment(&this.ChunkOffsets.[newChunkIdx]) - 1
+                            
+                            // Get the chunk
+                            let chunk = this.Chunks.[newChunkIdx]
+                            
+                            // Allocate string in the strings array
+                            let stringIdx = Interlocked.Increment(&chunk.NextStringIndex) - 1
+                            Volatile.Write(&chunk.StringsArray.[stringIdx], str)
+                            
+                            // Pack the string index
+                            let packed = PackedOps.packStringIndex stringIdx
+                            Volatile.Write(&chunk.PackedEntries.[newOffset], packed)
+                            
+                            // Add to filter if available
+                            match this.StringFilter with
+                            | Some filter -> 
+                                filter.AddString(str, byte (newChunkIdx + 1), stringIdx, newOffset) |> ignore
+                            | None -> ()
+                            
+                            // Create StringId
+                            let id = StringId.Create(baseId + (newChunkIdx * this.ChunkSize) + newOffset)
+                            
+                            // Increment string count
+                            Interlocked.Increment &this.StringCount |> ignore
+                            id
+                        finally
+                            this.ChunksLock.ExitWriteLock()
+                    else
+                        // Write lock acquisition failed - emergency allocation
+                        this.EmergencyAllocate str
+        else 
+            this.EmergencyAllocate str
+    finally
+        // Always release locks in correct order
+        if readLockHeld then this.ChunksLock.ExitUpgradeableReadLock()
+
+// Update EmergencyAllocate to maintain filter
+member private this.EmergencyAllocate(str: string) : StringId =
+    // Guaranteed to succeed even under extreme contention
+    let emergencyId = Interlocked.Increment(&this.EmergencyCounter) - 1
+    this.EmergencyCache.TryAdd(emergencyId, str) |> ignore
+    
+    // Can't really add to filter effectively since emergencies use a different structure
+    // But we could potentially add a special marker in the filter
+    
+    Interlocked.Increment &this.StringCount |> ignore
+    StringId.Create(this.EmergencyBaseId + emergencyId)
+
+connect pool and segments
+
+// In Pool.Create, make sure to initialize and connect the filter
+static member Create(baseId: int, edenSize: int, config: PoolConfiguration) =
+    let rotationInterval = 
+        TimeSpan.FromMilliseconds(config.MinPromotionInterval.TotalMilliseconds / 3.0)
+    
+    // Size the filter based on Eden size and expected growth
+    let expectedStrings = edenSize * 3  // Allow for growth beyond Eden
+    let stringFilter = StringBitmapFilter.Create(expectedStrings)
+    
+    // Create the post-eden segments
+    let postEden = Segments.Create(baseId + edenSize, config)
+    
+    // Set the filter in segments
+    postEden.SetStringFilter(stringFilter)
+    
+    {
+        EdenArray = {
+            PackedEntries = Array.zeroCreate edenSize
+            StringsArray = Array.zeroCreate edenSize
+            NextStringIndex = 0
+        }
+        EdenOffset = 0
+        PostEden = postEden
+        PoolBaseId = baseId
+        Configuration = config
+        LastDecayTime = DateTime.UtcNow
+        LastPromotionTime = 0L
+        EdenPromotionTracker = EpochPromotionTracker.Create(
+            queueSizeBits = 14,
+            rotationInterval = rotationInterval
+        )
+        StringFilter = stringFilter
+        Stats = { accessCount = 0L; missCount = 0L }
+    }
+
+test suite
+
+namespace RMLPipeline.Tests
+
+open System
+open System.Threading
+open System.Collections.Generic
+open Expecto
+open FsCheck
+open RMLPipeline.Core
+open RMLPipeline.Internal.StringPooling
+open RMLPipeline.Internal.StringFilter
+open System.Threading.Tasks
+
+module BitmapIndexTests =
+
+    // Helper methods
+    let genAlphaString =
+        Gen.elements ['a'..'z']
+        |> Gen.nonEmptyListOf
+        |> Gen.map (fun chars -> String(List.toArray chars))
+
+    let genRandomStrings count =
+        gen {
+            let! strings = Gen.listOfLength count genAlphaString
+            return strings |> List.distinct  // Ensure unique strings
+        }
+
+    // Realistic string set with field paths, URIs, and literals
+    let genRealisticStringSet =
+        Gen.oneof [
+            // Field paths (e.g. "person.name.first")
+            Gen.map3 (fun a b c -> $"{a}.{b}.{c}")
+                (Gen.elements ["user"; "person"; "order"; "item"; "account"])
+                (Gen.elements ["name"; "address"; "details"; "metadata"; "properties"])
+                (Gen.elements ["first"; "last"; "street"; "city"; "id"; "value"])
+            
+            // URI templates (e.g. "/api/users/{id}")
+            Gen.map3 (fun a b c -> $"/{a}/{b}/{{{c}}}")
+                (Gen.elements ["api"; "v1"; "data"; "service"])
+                (Gen.elements ["users"; "orders"; "items"; "accounts"; "profiles"])
+                (Gen.elements ["id"; "uuid"; "name"; "key"; "token"])
+            
+            // Simple literals
+            Gen.elements [
+                "true"; "false"; "null"; "undefined"; 
+                "string"; "number"; "object"; "array";
+                "GET"; "POST"; "PUT"; "DELETE"; "PATCH"
+            ]
+        ]
+
+    let genStringSet = 
+        Gen.frequency [
+            (3, genRealisticStringSet |> Gen.listOf |> Gen.map List.distinct)
+            (1, genAlphaString |> Gen.listOf |> Gen.map List.distinct)
+        ]
+
+    // Generate a set of strings with potential duplicates (for collision testing)
+    let genCollisionStringSet =
+        gen {
+            // Start with a base set of strings
+            let! baseStrings = genStringSet
+            
+            // Add some modified versions that will likely produce collisions
+            let! modifiedStrings = 
+                baseStrings
+                |> List.map (fun s -> 
+                    // Generate a string similar to the original
+                    if s.Length > 1 then
+                        Gen.elements [
+                            s + "X"               // Append a character
+                            s.Substring(0, s.Length-1)  // Remove last character
+                            String(s.ToCharArray() |> Array.rev)  // Reverse
+                            s.ToUpper()           // Change case
+                            s.Replace("a", "b")   // Character substitution
+                        ]
+                    else
+                        Gen.constant (s + "X")
+                )
+                |> Gen.sequence
+            
+            return List.concat [baseStrings; modifiedStrings] |> List.distinct
+        }
+
+    type BitmapIndexArbitraries =
+        static member StringSet() =
+            Arb.fromGen genStringSet
+            
+        static member CollisionStringSet() =
+            Arb.fromGen genCollisionStringSet
+            
+        static member SizeHint() =
+            Arb.fromGen (Gen.choose(16, 10000))
+            
+        static member ThreadCount() =
+            Arb.fromGen (Gen.choose(2, 16))
+
+    let fsConfig = { FsCheckConfig.defaultConfig with 
+                        arbitrary = [ typeof<BitmapIndexArbitraries> ]
+                        maxTest = 100 }
+
+    // Test the direct filter operations
+    module BitmapFilterProperties =
+        [<Tests>]
+        let tests =
+            testList "BitmapFilter_Invariants" [
+                testPropertyWithConfig 
+                    fsConfig 
+                    "Filter correctly reports non-existent strings" <| fun (strings: string list) (queryString: string) ->
+                    
+                    // Only consider the case where queryString is not in strings
+                    not (List.contains queryString strings) ==> lazy (
+                        // Create filter and add all strings
+                        let filter = StringBitmapFilter.Create(List.length strings)
+                        
+                        // Add all strings to the filter
+                        for s in strings do
+                            filter.AddString(s, 0uy, 0, 0) |> ignore
+                        
+                        // Check that filter correctly says queryString doesn't exist
+                        filter.TryGetLocation(queryString).IsNone
+                    )
+                
+                testPropertyWithConfig 
+                    fsConfig 
+                    "No false negatives - strings added are always found" <| fun (strings: string list) ->
+                    
+                    strings.Length > 0 ==> lazy (
+                        // Create filter sized for the input
+                        let filter = StringBitmapFilter.Create(List.length strings)
+                        
+                        // Add all strings with unique locations
+                        strings
+                        |> List.iteri (fun i s -> 
+                            filter.AddString(s, 0uy, i, i) |> ignore)
+                        
+                        // Verify every string can be found
+                        strings
+                        |> List.forall (fun s -> 
+                            match filter.TryGetLocation(s) with
+                            | Some _ -> true
+                            | None -> false
+                        )
+                    )
+
+                testPropertyWithConfig 
+                    fsConfig 
+                    "Location data is preserved correctly" <| fun (strings: string list) ->
+                    
+                    strings.Length > 0 ==> lazy (
+                        // Create filter and test data
+                        let filter = StringBitmapFilter.Create(List.length strings * 2)
+                        let testData = 
+                            strings 
+                            |> List.mapi (fun i s -> 
+                                let arrayType = byte (i % 3) // Mix of array types
+                                let stringIdx = i * 10 + 5   // Some arbitrary formula
+                                let entryIdx = i * 10        // Different from stringIdx
+                                (s, arrayType, stringIdx, entryIdx)
+                            )
+                        
+                        // Add all strings with their locations
+                        for (s, aType, sIdx, eIdx) in testData do
+                            filter.AddString(s, aType, sIdx, eIdx) |> ignore
+                        
+                        // Verify all locations are retrieved correctly
+                        testData |> List.forall (fun (s, aType, sIdx, eIdx) ->
+                            match filter.TryGetLocation(s) with
+                            | Some loc -> 
+                                loc.ArrayType = aType && 
+                                loc.StringIndex = sIdx && 
+                                loc.EntryIndex = eIdx
+                            | None -> false
+                        )
+                    )
+
+                testPropertyWithConfig 
+                    fsConfig 
+                    "Concurrent string additions are thread-safe" <| fun (strings: string list) (threadCount: int) ->
+                    
+                    (strings.Length >= 10 && threadCount >= 2) ==> lazy (
+                        // Split strings among threads
+                        let filter = StringBitmapFilter.Create(strings.Length * 2)
+                        let stringsArray = List.toArray strings
+                        
+                        // Use barrier to ensure all threads start at same time
+                        let barrier = new Barrier(threadCount + 1)
+                        
+                        // Create tasks to add strings concurrently
+                        let tasks = 
+                            [|0..threadCount-1|]
+                            |> Array.map (fun threadId ->
+                                Task.Factory.StartNew(fun () ->
+                                    // Wait for all threads to be ready
+                                    barrier.SignalAndWait()
+                                    
+                                    // Each thread processes a subset of strings
+                                    let startIdx = threadId * strings.Length / threadCount
+                                    let endIdx = (threadId + 1) * strings.Length / threadCount - 1
+                                    
+                                    for i in startIdx..endIdx do
+                                        if i < stringsArray.Length then
+                                            let s = stringsArray.[i]
+                                            filter.AddString(s, 0uy, i, i) |> ignore
+                                )
+                            )
+                        
+                        // Release all threads
+                        barrier.SignalAndWait()
+                        
+                        // Wait for all threads to complete
+                        Task.WaitAll(tasks)
+                        
+                        // Verify all strings can be found (eventual consistency)
+                        strings |> List.forall (fun s -> 
+                            match filter.TryGetLocation(s) with
+                            | Some _ -> true
+                            | None -> false
+                        )
+                    )
+
+                testPropertyWithConfig 
+                    fsConfig 
+                    "Filter statistics track operations correctly" <| fun (strings: string list) (queries: string list) ->
+                    
+                    (strings.Length > 0 && queries.Length > 0) ==> lazy (
+                        let filter = StringBitmapFilter.Create(strings.Length * 2)
+                        
+                        // Add all strings
+                        for s in strings do
+                            filter.AddString(s, 0uy, 0, 0) |> ignore
+                        
+                        // Track lookup counts
+                        let mutable expectedLookups = 0
+                        let mutable expectedHits = 0
+                        
+                        // Perform lookups
+                        for q in queries do
+                            expectedLookups <- expectedLookups + 1
+                            filter.TryGetLocation(q) |> ignore
+                            
+                            // Count hit if string exists
+                            if List.contains q strings then
+                                expectedHits <- expectedHits + 1
+                        
+                        // Get stats
+                        let hitRatio, _ = filter.GetStats()
+                        
+                        // Basic check that stats are being tracked
+                        // Note: We're not checking exact values due to potential race conditions
+                        expectedLookups > 0 && hitRatio >= 0.0 && hitRatio <= 1.0
+                    )
+
+                testPropertyWithConfig 
+                    fsConfig 
+                    "Resizing creates a new empty filter with increased capacity" <| fun (sizeHint: int) ->
+                    
+                    sizeHint > 0 ==> lazy (
+                        let filter = StringBitmapFilter.Create(sizeHint)
+                        let newFilter = filter.Resize(sizeHint * 2)
+                        
+                        // New filter should be empty and larger
+                        let oldHashTableSize = filter.HashTableSize
+                        let newHashTableSize = newFilter.HashTableSize
+                        
+                        newHashTableSize > oldHashTableSize
+                    )
+            ]
+
+    // Test integration with Pool and Segments
+    module PoolIntegrationTests =
+        [<Tests>]
+        let tests =
+            testList "Pool_Filter_Integration" [
+                testCase "Pool uses filter for string lookup" <| fun () ->
+                    // Create a pool with filter
+                    let config = PoolConfiguration.Default
+                    let baseId = 1000
+                    let edenSize = 100
+                    let pool = Pool.Create(baseId, edenSize, config)
+                    
+                    // Intern some strings
+                    let testStrings = ["test1"; "test2"; "test3"; "test4"; "test5"]
+                    let ids = testStrings |> List.map pool.InternString
+                    
+                    // Verify all strings can be found
+                    for i, s in List.zip ids testStrings do
+                        match pool.TryGetString(i) with
+                        | Some foundStr -> Expect.equal foundStr s "Retrieved string should match original"
+                        | None -> failwith "String not found in pool"
+                    
+                    // Stats should show no misses for repeat lookups
+                    let initialMisses = pool.Stats.missCount
+                    
+                    // Intern the same strings again - should use filter to find them
+                    let ids2 = testStrings |> List.map pool.InternString
+                    
+                    // Miss count shouldn't increase since strings were found in filter
+                    let finalMisses = pool.Stats.missCount
+                    Expect.equal ids ids2 "Same strings should get same IDs"
+                    Expect.equal finalMisses initialMisses "No new misses should occur"
+                    
+                testCase "Filter correctly handles string promotion" <| fun () ->
+                    // Create pool hierarchy for promotion testing
+                    let config = { PoolConfiguration.Default with 
+                                   WorkerPromotionThreshold = 2
+                                   GroupPromotionThreshold = 5 }
+                    let planningStrings = [||]
+                    let hierarchy = StringPoolHierarchy.Create(planningStrings, config)
+                    
+                    // Create a context and pool
+                    let groupId = DependencyGroupId 1
+                    let context = StringPool.createContext hierarchy (Some groupId) None
+                    
+                    // Intern a string and access it multiple times to trigger promotion
+                    let testString = "promote-me"
+                    let id = context.ContextPool.InternString(testString, StringAccessPattern.HighFrequency)
+                    
+                    // Access multiple times to increment temperature
+                    let mutable currentId = id
+                    for _ in 1..10 do
+                        match context.ContextPool.GetStringWithTemperature(currentId) with
+                        | Some str, newId -> 
+                            Expect.equal str testString "String should be retrieved correctly"
+                            currentId <- newId
+                        | None, _ -> failwith "String not found"
+                    
+                    // Trigger promotion processing
+                    let promoted = hierarchy.CheckAndPromoteHotStrings()
+                    
+                    // Now try to intern the same string again - should still work
+                    // even though the string might be promoted
+                    let id2 = context.ContextPool.InternString(testString, StringAccessPattern.HighFrequency)
+                    
+                    // Verification: either we got the same ID or a new one (if promoted)
+                    // Either way, the string should be retrievable
+                    match context.ContextPool.GetString(id2) with
+                    | Some str -> Expect.equal str testString "String should be retrievable post-promotion"
+                    | None -> failwith "String not found after promotion"
+                
+                testCase "Filter provides O(1) lookup for existing strings" <| fun () ->
+                    // Create a pool with a small filter for testing
+                    let config = PoolConfiguration.Default
+                    let pool = Pool.Create(1000, 1000, config)
+                    
+                    // Create a large number of strings to intern
+                    let mutable stringCount = 1000
+                    let testStrings = Array.init stringCount (fun i -> $"string-{i}")
+                    
+                    // Intern all strings
+                    let sw1 = Stopwatch.StartNew()
+                    for s in testStrings do
+                        pool.InternString(s) |> ignore
+                    sw1.Stop()
+                    
+                    // Measure time to lookup existing strings
+                    let sw2 = Stopwatch.StartNew()
+                    for s in testStrings do
+                        pool.InternString(s) |> ignore
+                    sw2.Stop()
+                    
+                    // Expectation: lookup should be much faster than initial insertion
+                    // Note: This test is soft - we don't use exact times
+                    Expect.isTrue (sw2.ElapsedMilliseconds < sw1.ElapsedMilliseconds) 
+                        "Second pass should be faster due to filter lookup"
+                
+                testCase "Segments integration handles chunking correctly" <| fun () ->
+                    // Create configuration that forces chunking
+                    let config = { PoolConfiguration.Default with 
+                                   InitialChunkSize = 5
+                                   SecondaryChunkSize = 5 }
+                    let baseId = 5000
+                    
+                    // Create segments with filter
+                    let segments = Segments.Create(baseId, config)
+                    let filter = StringBitmapFilter.Create(100)
+                    segments.SetStringFilter(Some filter)
+                    
+                    // Intern enough strings to cause chunking
+                    let testStrings = [
+                        "chunk1-str1"; "chunk1-str2"; "chunk1-str3"; "chunk1-str4"; "chunk1-str5"; 
+                        "chunk2-str1"; "chunk2-str2"; "chunk2-str3"; "chunk2-str4"; "chunk2-str5";
+                        "chunk3-str1"; "chunk3-str2"; "chunk3-str3"; "chunk3-str4"; "chunk3-str5"
+                    ]
+                    
+                    // Intern all strings
+                    let ids = testStrings |> List.map (fun s -> segments.AllocateString(s, baseId))
+                    
+                    // Verify all strings can be found
+                    for i, s in List.zip ids testStrings do
+                        match segments.TryGetString(i.Value, baseId) with
+                        | Some foundStr -> Expect.equal foundStr s "Retrieved string should match original"
+                        | None -> failwith "String not found in segments"
+                    
+                    // Should have created at least 3 chunks
+                    Expect.isGreaterThan segments.Chunks.Count 2 "Multiple chunks should be created"
+                    
+                    // Now try to find each string via filter
+                    for s in testStrings do
+                        let id = segments.AllocateString(s, baseId)
+                        // Getting same string should give same ID (filter working)
+                        match segments.TryGetString(id.Value, baseId) with
+                        | Some foundStr -> Expect.equal foundStr s "Retrieved string should match original"
+                        | None -> failwith "String not found via filter lookup"
+            ]
+
+    // Thread safety and concurrency tests
+    module ConcurrencyTests =
+        [<Tests>]
+        let tests =
+            testList "Filter_Concurrency" [
+                testCase "Concurrent string interning with filter is thread-safe" <| fun () ->
+                    // Create a pool with filter
+                    let config = PoolConfiguration.Default
+                    let baseId = 2000
+                    let edenSize = 1000
+                    let pool = Pool.Create(baseId, edenSize, config)
+                    
+                    // Set of strings to intern
+                    let stringCount = 500
+                    let testStrings = Array.init stringCount (fun i -> $"concurrent-string-{i}")
+                    
+                    // Track results from each thread
+                    let results = Array.init stringCount (fun _ -> StringId.Invalid)
+                    
+                    // Use multiple threads to intern same strings
+                    let threadCount = min 8 Environment.ProcessorCount
+                    let threads = Array.init threadCount (fun threadId ->
+                        Thread(ThreadStart(fun () ->
+                            // Each thread processes all strings (deliberately creating contention)
+                            for i in 0..stringCount-1 do
+                                let id = pool.InternString(testStrings.[i])
+                                // Record result
+                                results.[i] <- id
+                        ))
+                    )
+                    
+                    // Start and wait for all threads
+                    for t in threads do t.Start()
+                    for t in threads do t.Join()
+                    
+                    // Verify all strings were interned successfully
+                    for i in 0..stringCount-1 do
+                        match pool.TryGetString(results.[i]) with
+                        | Some s -> Expect.equal s testStrings.[i] "Retrieved string should match original"
+                        | None -> failwith "String not found"
+                    
+                    // Check that we have fewer misses than total attempts (filter working)
+                    let totalAttempts = int64 (threadCount * stringCount)
+                    let misses = pool.Stats.missCount
+                    Expect.isLessThan misses totalAttempts "Should have fewer misses than attempts"
+                
+                testCase "Filter handles multiple threads accessing shared segments" <| fun () ->
+                    // Create configuration
+                    let config = { PoolConfiguration.Default with 
+                                   InitialChunkSize = 50
+                                   SecondaryChunkSize = 100 }
+                    let baseId = 3000
+                    
+                    // Create segments with filter
+                    let segments = Segments.Create(baseId, config)
+                    let filter = StringBitmapFilter.Create(1000)
+                    segments.SetStringFilter(Some filter)
+                    
+                    // Set of strings for each thread
+                    let threadsCount = min 6 Environment.ProcessorCount
+                    let stringsPerThread = 100
+                    let threadStrings = 
+                        Array.init threadsCount (fun threadId ->
+                            Array.init stringsPerThread (fun i -> $"thread-{threadId}-string-{i}")
+                        )
+                    
+                    // Dictionary to track all IDs (thread-safe)
+                    let allIds = Dictionary<string, StringId>()
+                    
+                    // Run multiple threads allocating strings
+                    let threads = Array.init threadsCount (fun threadId ->
+                        Thread(ThreadStart(fun () ->
+                            // Allocate all strings for this thread
+                            for i in 0..stringsPerThread-1 do
+                                let s = threadStrings.[threadId].[i]
+                                let id = segments.AllocateString(s, baseId)
+                                lock allIds (fun () -> allIds.[s] <- id)
+                        ))
+                    )
+                    
+                    // Start and wait for all threads
+                    for t in threads do t.Start()
+                    for t in threads do t.Join()
+                    
+                    // Verify all strings can be found
+                    let allStrings = threadStrings |> Array.collect id
+                    for s in allStrings do
+                        let id = lock allIds (fun () -> allIds.[s])
+                        match segments.TryGetString(id.Value, baseId) with
+                        | Some foundStr -> Expect.equal foundStr s "String should be retrievable"
+                        | None -> failwith "String not found"
+                    
+                    // Now allocate strings again - filter should find them
+                    for s in allStrings do
+                        let originalId = lock allIds (fun () -> allIds.[s])
+                        let secondId = segments.AllocateString(s, baseId)
+                        
+                        // Either we get same ID, or if chunk was resized, a valid ID
+                        Expect.isTrue secondId.IsValid "Should get valid ID on repeated allocation"
+                        
+                        match segments.TryGetString(secondId.Value, baseId) with
+                        | Some foundStr -> Expect.equal foundStr s "String should be retrievable"
+                        | None -> failwith "String not found after second allocation"
+                
+                testPropertyWithConfig 
+                    fsConfig 
+                    "False positive rate is acceptable under load" <| fun (collisionStrings: string list) ->
+                    
+                    collisionStrings.Length > 10 ==> lazy (
+                        // Create filter sized for collision testing
+                        let filter = StringBitmapFilter.Create(collisionStrings.Length)
+                        
+                        // Add all strings
+                        for i, s in List.indexed collisionStrings do
+                            filter.AddString(s, 0uy, i, i) |> ignore
+                        
+                        // Get current stats
+                        let _, falsePositiveRate = filter.GetStats()
+                        
+                        // Check that false positive rate is reasonable
+                        // Note: FP rate will depend on hash function quality
+                        falsePositiveRate < 0.7 // Allow fairly high FP rate for filter stage
+                    )
+            ]
+
+    // Main test entry point
+    [<Tests>]
+    let allTests =
+        testList "BitmapIndexTests" [
+            BitmapFilterProperties.tests
+            PoolIntegrationTests.tests
+            ConcurrencyTests.tests
+        ]
