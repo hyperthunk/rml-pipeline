@@ -5,6 +5,7 @@
         open RMLPipeline.Tests.VocabSuite
         open RMLPipeline.Tests.TemplateTests
         open RMLPipeline.Tests.StringInterningTests
+        open RMLPipeline.Tests.StringPoolIntegrationTests
         open RMLPipeline.Tests.PlannerModelTests
         open RMLPipeline.Tests.TypeLevelTests
         // open RMLPipeline.Tests.PipelineModelBased
@@ -21,6 +22,7 @@
                 testList "RMLPipeline" [
                     TypeLevelTests.allTests
                     allStringInterningTests
+                    allStringPoolIntegrationTests
                     allComputationRMLTests
                     allTemplateTests
                     allStatefulPlannerTests

@@ -38,6 +38,7 @@ module StringPooling =
         LiteralTemperatureFactor: float
         
         // Temperature decay and threshold scaling
+        // Decay settings are only used by the polling thread that manages promotions
         TemperatureDecayFactor: float  // How much to decay temperatures (e.g., 0.5 = half)
         DecayInterval: TimeSpan        // How often to decay temperatures
         ThresholdScalingFactor: float  // How much to increase thresholds as pools grow
@@ -65,7 +66,7 @@ module StringPooling =
             DecayInterval = TimeSpan.FromHours(1.0)
             ThresholdScalingFactor = 1.2
             ThresholdScalingInterval = 10000
-            MinPromotionInterval = TimeSpan.FromMilliseconds(100.0)
+            MinPromotionInterval = TimeSpan.FromMilliseconds 100.0
             MaxPromotionBatchSize = 50
         }
         
@@ -183,10 +184,12 @@ module StringPooling =
                                 float Stopwatch.Frequency / 1000.0)
             
             if elapsed < minTicks then
+                printfn "Skipping dequeue - not enough time since last processing"
                 [||]  // Too soon
             else
                 // Try to claim the promotion window
                 if Interlocked.CompareExchange(&this.LastProcessedTime, now, lastTime) <> lastTime then
+                    printfn "Skipping dequeue - another thread is processing"
                     [||]  // Another thread is processing
                 else
                     // We have exclusive access to dequeue
@@ -194,7 +197,7 @@ module StringPooling =
                     let tail = Volatile.Read(&this.Tail)
                     let available = int (tail - head)
                     let toDequeue = min available maxCount
-                    
+                    printfn "Dequeueing %d items" toDequeue
                     if toDequeue > 0 then
                         let results = Array.zeroCreate toDequeue
                         for i = 0 to toDequeue - 1 do
@@ -253,6 +256,7 @@ module StringPooling =
                 // Try to claim the rotation
                 Interlocked.CompareExchange(&this.LastRotationTime, now, lastRotation) = lastRotation
             else
+                printfn "Not rotating epochs yet"
                 false
         
         // Process promotions - called periodically by promotion processing thread
@@ -260,6 +264,7 @@ module StringPooling =
         member this.ProcessPromotions(resolver: StringId -> string option) : PromotionCandidate[] =
             // First check if we should rotate
             if this.CheckRotation() then
+                printfn "Rotating epochs"
                 Interlocked.Increment(&this.CurrentWriteEpoch) |> ignore
             
             // Only one thread should process at a time
@@ -295,6 +300,7 @@ module StringPooling =
                 finally
                     Monitor.Exit this.ProcessingLock
             else
+                printfn "Skipping promotion processing - already in progress"
                 [||]  // Another thread is processing
 
     (* For use in single-threaded execution *)
@@ -616,6 +622,7 @@ module StringPooling =
                 // Always release locks in correct order
                 if readLockHeld then this.ChunksLock.ExitUpgradeableReadLock()
 
+        // TODO: Re-introduce the adaptive threshold when calculating promotions
         member this.GetAdaptiveThreshold() : int32 =
             let count = Volatile.Read(&this.StringCount)  // Uses the count we're tracking
             let scaleFactor = 
@@ -660,8 +667,23 @@ module StringPooling =
                                 if not (isNull str) then Some str else None
                             else 
                                 None
-                    else None
-                else None
+                    else 
+                        None
+                else 
+                    None
+
+        member this.GetStringWithTemperature(id: StringId, baseId: int) : (string option * StringId) =
+            match this.TryGetString(id.Value, baseId) with
+            | Some str ->
+                let newId = id.IncrementTemperature()
+                
+                // Check if temperature crosses threshold
+                if newId.Temperature = this.PromotionThreshold then
+                    this.PromotionTracker.SignalPromotion(newId, newId.Temperature) |> ignore
+                
+                Some str, newId
+            | None ->
+                None, id
         
         interface IDisposable with
             member this.Dispose() = 
@@ -761,18 +783,39 @@ module StringPooling =
             // Or track the original IDs separately...
             
             let postEdenBaseId = this.PoolBaseId + this.EdenArray.PackedEntries.Length
-            let postEdenCandidates = this.PostEden.ProcessPromotions(postEdenBaseId)
+            let postEdenCandidates = this.PostEden.ProcessPromotions postEdenBaseId
             
             Array.append edenCandidates postEdenCandidates
-        
+    
+        member this.GetAdaptiveThreshold() : int32 =
+            let baseThreshold = 
+                if this.PoolBaseId < IdAllocation.GroupPoolBase then 
+                    this.Configuration.GroupPromotionThreshold 
+                else 
+                    this.Configuration.WorkerPromotionThreshold
+            
+            // We're already reading EdenOffset during allocation
+            let edenCount = Volatile.Read(&this.EdenOffset)
+            let postEdenCount = Volatile.Read(&this.PostEden.StringCount)
+            let totalCount = edenCount + postEdenCount
+            
+            let scaleFactor = 
+                1.0 + 
+                (float totalCount / float this.Configuration.ThresholdScalingInterval) * 
+                (this.Configuration.ThresholdScalingFactor - 1.0)
+            
+            int32 (float baseThreshold * scaleFactor)
+
+        (* Relies on the caller not to repeatedly intern the same string *)
         member this.InternString(str: string) : StringId =
             if isNull str || str.Length = 0 then
                 raise (ArgumentException "String cannot be null or empty")
                             
             // Opportunistically check for promotion
+            // TODO: avoid promotion storms
             this.CheckPromotion() |> ignore
             
-            Interlocked.Increment(&this.Stats.accessCount) |> ignore
+            Interlocked.Increment &this.Stats.accessCount |> ignore
             
             let edenIdx = Interlocked.Increment(&this.EdenOffset) - 1
             if edenIdx < this.EdenArray.PackedEntries.Length then
@@ -909,7 +952,7 @@ module StringPooling =
             | ValueNone ->
                 // Use runtime pool
                 Interlocked.Increment(&this.Stats.missCount) |> ignore
-                this.RuntimePool.InternString(str)
+                this.RuntimePool.InternString str
         
         member this.TryGetStringId(str: string) : StringId option =
             match FastMap.tryFind str this.PlanningStrings with
