@@ -69,9 +69,11 @@ module Planner =
     open System
     open System.Runtime.CompilerServices
     open RMLPipeline
+    open RMLPipeline.Core
     open RMLPipeline.FastMap.Types
     open RMLPipeline.Model
-    open RMLPipeline.Internal.StringInterning_1
+    open RMLPipeline.Internal.StringInterning
+    open RMLPipeline.Internal.StringPooling
 
     /// <summary>
     /// Memory modes for the planner, allowing adaptive behavior based on 
@@ -233,13 +235,13 @@ module Planner =
     type HotPathStringResolver(planningContext: PoolContextScope) =
         
         [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-        member __.GetString(stringId: StringId) : string option =
+        member __.GetString(stringId: StringId) : string voption =
             planningContext.GetString(stringId)
                 
         member __.GetStringUnsafe(stringId: StringId) : string =
             match planningContext.GetString stringId with
-            | Some str -> str
-            | None -> failwith $"StringId {stringId.Value} not found in planning context"
+            | ValueSome str -> str
+            | ValueNone -> failwith $"StringId {stringId.Value} not found in planning context"
 
     /// <summary>
     /// The execution plan for a single triples map, containing all the 
@@ -1102,16 +1104,16 @@ module Planner =
     module PlanUtils =
         
         // Get the actual string value from a StringId using the plan's context
-        let getString (plan: RMLPlan) (stringId: StringId) : string option =
+        let getString (plan: RMLPlan) (stringId: StringId) : string voption =
             plan.PlanningContext.GetString stringId
         
         let getMemoryStats (plan: RMLPlan) : PoolStats =
             StringPool.getAggregateStats plan.StringPoolHierarchy
         
         let getTupleInfo (plan: RMLPlan) (tuple: PredicateTuple) : string * string * string =
-            let subject = getString plan tuple.SubjectTemplateId |> Option.defaultValue "?"
-            let predicate = getString plan tuple.PredicateValueId |> Option.defaultValue "?"
-            let object = getString plan tuple.ObjectTemplateId |> Option.defaultValue "?"
+            let subject = getString plan tuple.SubjectTemplateId |> ValueOption.defaultValue "?"
+            let predicate = getString plan tuple.PredicateValueId |> ValueOption.defaultValue "?"
+            let object = getString plan tuple.ObjectTemplateId |> ValueOption.defaultValue "?"
             (subject, predicate, object)
         
         /// Get readable tuple flags for debugging

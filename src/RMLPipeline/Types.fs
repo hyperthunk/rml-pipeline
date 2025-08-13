@@ -55,6 +55,16 @@ module Core =
         return f x y
     }
 
+    /// Represents a pattern for accessing strings in the RML pipeline.
+    [<Flags>]
+    type StringAccessPattern =
+        | Unknown = 0
+        | HighFrequency = 1
+        | MediumFrequency = 2
+        | LowFrequency = 4
+        | Planning = 8
+        | Runtime = 16
+
     (* Scalar (e.g., attribute/column) value handling *)       
     type RMLValue =
         | StringValue of string
@@ -135,6 +145,11 @@ module Core =
         
         static member inline Create(id: int32) = 
             StringId (int64 id)
+        
+        static member inline CreateWithTemperature(baseId: int32, temperature: int32) =
+            if temperature > StringId.MaxTemperature then
+                failwith "Temperature exceeds maximum"
+            StringId((int64 temperature <<< 32) ||| int64 baseId)
         
         static member Invalid = StringId -1L
 

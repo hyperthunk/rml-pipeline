@@ -7,6 +7,8 @@ open Expecto
 open RMLPipeline
 open RMLPipeline.Core
 open RMLPipeline.Internal.StringPooling
+open RMLPipeline.Internal.StringInterning
+open RMLPipeline.Internal.StringInterning.Packing
 open StringInterningGenerators
 
 /// Low-level tests for the string interning components
@@ -256,7 +258,6 @@ module StringPoolIntegrationTests =
                         Expect.equal !successCount 1 "Only one thread should get promotion candidates" *)
                 ]
 
-    // ==================== Pool Tests ====================
     module PoolTests =
         module SingleThreaded =
             
@@ -437,7 +438,6 @@ module StringPoolIntegrationTests =
                         Expect.equal !successCount 1 "Only one thread should get promotion candidates" *)
                 ]
 
-    // ==================== LocalPool Tests ====================
     module LocalPoolTests =
         // Create test local pool
         let createTestLocalPool 
@@ -600,13 +600,13 @@ module StringPoolIntegrationTests =
                 ]
 
         module MultiThreaded =
+            // TODO: this invariant no longer holds, so we should write the tests...
             // This section is intentionally left empty as LocalPool is designed
             // to be used by a single thread (worker) at a time
             [<Tests>]
             let tests =
                 testList "MultiThreadedLocalPoolTests" []
-
-    // ==================== Promotion Tests ====================
+    
     module PromotionTests =
         [<Tests>]
         let tests =

@@ -6,7 +6,7 @@ open System.Diagnostics
 open Expecto
 open FsCheck
 open RMLPipeline.Core
-open RMLPipeline.Internal.StringPooling
+open RMLPipeline.Internal.StringInterning.Promotions
 open RMLPipeline.FastMap.Types
 // open RMLPipeline.Internal.StringInterning
 open FSharp.HashCollections

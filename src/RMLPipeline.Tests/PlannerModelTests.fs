@@ -7,7 +7,8 @@ open RMLPipeline.Model
 open RMLPipeline.DSL
 open RMLPipeline.Internal
 open RMLPipeline.Internal.Planner
-open RMLPipeline.Internal.StringInterning_1
+open RMLPipeline.Internal.StringInterning
+open RMLPipeline.Internal.StringPooling
 open System
 
 module PlannerModelTests =
@@ -165,8 +166,8 @@ module PlannerModelTests =
             // Invariant 1: All maps must have consistent StringPool integration
             let stringPoolCheck = 
                 plan.OrderedMaps |> Array.forall (fun mapPlan ->
-                    PlanUtils.getString plan mapPlan.IteratorPathId |> Option.isSome)
-            
+                    PlanUtils.getString plan mapPlan.IteratorPathId |> ValueOption.isSome)
+
             // Invariant 2: Dependency groups must be non-overlapping and complete
             let dependencyGroupCheck = 
                 let allGroupMembers = 

@@ -1,6 +1,7 @@
 namespace RMLPipeline.Tests
 
 open RMLPipeline.Core
+open RMLPipeline.Internal.StringInterning
 open RMLPipeline.Internal.StringPooling
 open System
 open System.Threading
