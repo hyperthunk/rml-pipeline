@@ -1,0 +1,766 @@
+This is an excellent analysis of a fundamental challenge in your string pooling design. Let me thoroughly analyze both approaches and their architectural implications.
+The Core Problem
+You need a way to check if a string has already been interned without:
+
+Using ConcurrentDictionary (due to convoy issues)
+Sacrificing O(1) StringId → String lookup
+Breaking the chunked memory layout
+Introducing locks on the hot path
+
+Option 1: Improved Bitmap Approach
+Current Limitation
+The linear probe in ProbeHashTable is the bottleneck. Here are several improvements:
+1a. Cuckoo Hashing
+fsharptype CuckooFilter = {
+    Table1: HashEntry[]
+    Table2: HashEntry[]
+    Hash1: string -> int
+    Hash2: string -> int
+}
+
+Pros: Guaranteed O(1) lookup with at most 2 memory accesses
+Cons: Complex insertion, potential for cycles requiring rebuilds
+
+1b. Robin Hood Hashing with Distance Tracking
+fsharp[<Struct>]
+type RobinHoodEntry = {
+    HashFragment: uint32
+    Location: StringLocation
+    Distance: int16  // Distance from ideal position
+    State: int32
+}
+
+Pros: Better cache locality, bounded probe distance
+Cons: More complex insertion logic
+
+1c. Hopscotch Hashing
+Store a bitmap in each bucket indicating which of the next N slots contain entries that hash to this bucket:
+fsharp[<Struct>]
+type HopscotchBucket = {
+    Entry: HashEntry
+    HopInfo: uint32  // Bitmap of next 32 slots
+}
+
+Pros: Cache-friendly, bounded search
+Cons: 4 bytes overhead per bucket
+
+Recommended Bitmap Enhancement: Segmented Hash Table
+fsharptype SegmentedHashTable = {
+    Segments: HashTableSegment[]
+    SegmentMask: uint32
+}
+
+and HashTableSegment = {
+    Entries: HashEntry[]
+    Lock: SpinLock  // Only for resize
+    LocalSize: int32
+}
+
+member this.TryGetLocation(str: string) =
+    let hash = fnv1aHash str
+    let segmentIdx = int ((hash >>> 48) &&& uint64 this.SegmentMask)
+    let segment = this.Segments.[segmentIdx]
+    
+    // Probe only within segment (better cache locality)
+    let localHash = uint32 (hash &&& 0xFFFFFFFFUL)
+    let slot = int (localHash % uint32 segment.LocalSize)
+    
+    // Bounded probe within segment
+    segment.ProbeLocal(hash, slot, maxProbes = 16)
+This reduces contention and improves cache locality by limiting probes to segments.
+Option 2: CTrie Implementation
+Architecture with Chunked Design
+A CTrie would serve as the string → location index, while your packed arrays remain the location → string storage:
+fsharptype PoolWithCTrie = {
+    // Storage (unchanged)
+    EdenArray: PackedPoolArray
+    PostEden: Segments
+    
+    // Index (replaces bitmap)
+    StringIndex: CTrie<string, StorageLocation>
+}
+
+and StorageLocation = {
+    PoolType: byte  // 0=Eden, 1=Segment
+    ChunkIndex: int16
+    EntryIndex: int32
+    StringIndex: int32
+}
+CTrie Integration Points
+
+During Allocation:
+
+fsharpmember this.InternString(str: string) =
+    match this.StringIndex.TryFind(str) with
+    | Some location ->
+        // Found - construct StringId from location
+        this.LocationToStringId(location)
+    | None ->
+        // Allocate in packed array
+        let id = this.AllocateNew(str)
+        let location = this.StringIdToLocation(id)
+        this.StringIndex.Insert(str, location)
+        id
+
+During Lookup (unchanged):
+
+fsharpmember this.GetString(id: StringId) =
+    // Direct O(1) array access - no CTrie needed
+    this.GetFromPackedArray(id)
+CTrie Advantages
+
+Lock-free operations with CAS-based updates
+Good cache locality for common prefixes (important for path strings)
+Scalable - no global locks or resize operations
+Memory efficient - shared prefixes
+
+CTrie Challenges
+
+Complex implementation - needs careful testing
+Memory overhead - internal nodes add ~32-64 bytes each
+GC pressure - many small node allocations
+Indirection cost - multiple pointer chases
+
+Architectural Impact Analysis
+Memory Overhead
+Bitmap Approach:
+
+Bitmap: ~1 bit per potential string
+Hash table: ~16 bytes per actual string
+Total: ~16-20 bytes per string
+
+CTrie Approach:
+
+Leaf nodes: ~32 bytes per string
+Internal nodes: ~64 bytes (amortized ~8-16 bytes per string)
+Total: ~40-48 bytes per string
+
+Performance Characteristics
+Bitmap (Enhanced):
+
+Insert: O(1) expected, lock-free
+Lookup: O(1) expected, 1-2 cache misses
+Memory access: Sequential within segments
+
+CTrie:
+
+Insert: O(log₃₂ n) expected, lock-free
+Lookup: O(log₃₂ n) expected, 3-5 cache misses
+Memory access: Pointer chasing
+
+Integration Complexity
+Bitmap: Minimal changes to existing code
+CTrie: Requires new abstraction layer
+Recommendation
+I recommend Enhanced Bitmap with Segmented Hash Table for these reasons:
+
+Maintains Architecture: Keeps your efficient packed array design intact
+Predictable Performance: Bounded probe distances, better cache locality
+Lower Memory Overhead: ~2.5x less than CTrie
+Simpler Implementation: Easier to verify correctness
+Better Integration: Natural fit with chunked design
+
+Hybrid Approach for Future
+Consider a hybrid where:
+
+Bitmap/hash table for Worker and Group pools (high churn)
+CTrie for Global pool (stable, benefits from prefix sharing)
+
+This gives you the best of both worlds without committing fully to either approach.
+Implementation Priority
+
+Start with segmented hash table enhancement
+Measure real-world performance
+Consider CTrie for specific pools if needed
+Keep the abstraction clean to allow future changes
+
+The key insight is that your packed array design already solves the hard problem (O(1) ID lookup). The string → ID index just needs to be "good enough" to prevent excessive duplicates while maintaining lock-free operation.RetryTCan you please sketch out all the code changes required for "Enhanced Bitmap with Segmented Hash Table", based on the bitmap implementation I uploaded.EditHere's a complete sketch of the code changes needed for the Enhanced Bitmap with Segmented Hash Table:
+1. Enhanced Core Types
+fsharpnamespace RMLPipeline.Internal
+
+module StringFilter =
+    open System
+    open System.Runtime.CompilerServices
+    open System.Threading
+    
+    /// FNV-1a hash algorithm remains unchanged
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    let inline fnv1aHash (str: string) : uint64 =
+        let prime = 1099511628211UL
+        let offset = 14695981039346656037UL
+        let mutable hash = offset
+        
+        for i = 0 to str.Length - 1 do
+            hash <- hash ^^^ uint64 (int str.[i])
+            hash <- hash * prime
+        
+        hash
+    
+    [<Struct>]
+    type FilterStats = {
+        TotalLookups: int64
+        Hits: int64        
+        Misses: int64      
+        FalsePositives: int64 
+        Collisions: int64  
+    }
+    
+    [<Struct>]
+    type StringLocation = {
+        /// 0 = Eden, 1+ = Segment index (directly maps to chunk index + 1)
+        ArrayType: byte
+        /// Index within the string array
+        StringIndex: int32
+        /// Index within the packed entries array (allows direct ID access)
+        EntryIndex: int32
+    }
+    
+    [<Struct>]
+    type HashEntry = {
+        /// Upper 32 bits of hash (for fast comparison)
+        HashFragment: uint32
+        /// Direct location information
+        Location: StringLocation
+        /// Distance from ideal position (for Robin Hood hashing)
+        Distance: int16
+        /// For lock-free insertion - 0 means empty slot
+        mutable State: int32
+    }
+    
+    /// Individual segment of the hash table
+    type HashTableSegment = {
+        Entries: HashEntry[]
+        SegmentSize: int32
+        SegmentMask: int32
+        mutable Lock: SpinLock  // Only used during resize
+        mutable Stats: FilterStats
+    } with
+        static member Create(size: int) =
+            let actualSize = 
+                let rec nextPow2 n =
+                    if n &&& (n - 1) = 0 then n else nextPow2 (n + 1)
+                nextPow2 size
+            
+            {
+                Entries = Array.zeroCreate actualSize
+                SegmentSize = actualSize
+                SegmentMask = actualSize - 1
+                Lock = SpinLock(false)
+                Stats = { TotalLookups = 0L; Hits = 0L; Misses = 0L; 
+                         FalsePositives = 0L; Collisions = 0L }
+            }
+        
+        /// Probe within segment using Robin Hood hashing
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        member this.ProbeLocal(hashFragment: uint32, startSlot: int, maxDistance: int16) : StringLocation option =
+            let mutable slot = startSlot
+            let mutable distance = 0s
+            
+            while distance <= maxDistance do
+                let entry = &this.Entries.[slot]
+                let state = Volatile.Read(&entry.State)
+                
+                if state = 0 then
+                    // Empty slot - not found
+                    None
+                elif entry.HashFragment = hashFragment && entry.Distance >= 0s then
+                    // Found matching hash
+                    Some entry.Location
+                elif entry.Distance < distance then
+                    // Robin Hood invariant violated - entry can't be here
+                    None
+                else
+                    // Continue searching
+                    slot <- (slot + 1) &&& this.SegmentMask
+                    distance <- distance + 1s
+            
+            None
+        
+        /// Insert with Robin Hood hashing
+        member this.InsertLocal(hashFragment: uint32, location: StringLocation, startSlot: int) : bool =
+            let mutable slot = startSlot
+            let mutable distance = 0s
+            let mutable toInsert = { 
+                HashFragment = hashFragment
+                Location = location
+                Distance = distance
+                State = 0 
+            }
+            
+            let mutable iterations = 0
+            let maxIterations = this.SegmentSize / 2
+            
+            while iterations < maxIterations do
+                let entry = &this.Entries.[slot]
+                let currentState = Volatile.Read(&entry.State)
+                
+                if currentState = 0 then
+                    // Found empty slot - try to claim it
+                    entry.HashFragment <- toInsert.HashFragment
+                    entry.Location <- toInsert.Location
+                    entry.Distance <- toInsert.Distance
+                    
+                    Thread.MemoryBarrier()
+                    
+                    if Interlocked.CompareExchange(&entry.State, 1, 0) = 0 then
+                        return true
+                else
+                    // Slot occupied - check if we should swap (Robin Hood)
+                    if entry.Distance < toInsert.Distance then
+                        // Current entry is richer (closer to home) - evict it
+                        let victim = { 
+                            HashFragment = entry.HashFragment
+                            Location = entry.Location
+                            Distance = entry.Distance
+                            State = 1 
+                        }
+                        
+                        // Atomic swap
+                        entry.HashFragment <- toInsert.HashFragment
+                        entry.Location <- toInsert.Location
+                        entry.Distance <- toInsert.Distance
+                        
+                        Thread.MemoryBarrier()
+                        
+                        // Continue with victim
+                        toInsert <- victim
+                
+                // Move to next slot
+                slot <- (slot + 1) &&& this.SegmentMask
+                toInsert.Distance <- toInsert.Distance + 1s
+                iterations <- iterations + 1
+            
+            // Table too full or cycle detected
+            false
+    
+    /// Enhanced string filter with segmented hash table
+    type SegmentedStringFilter = {
+        // Bloom filter for fast rejection
+        Bitmap: int64[]
+        BitmapMask: uint64
+        
+        // Segmented hash table
+        Segments: HashTableSegment[]
+        SegmentCount: int
+        SegmentShift: int  // How many bits to shift for segment selection
+        
+        // Global stats
+        mutable GlobalStats: FilterStats
+    } with
+        static member Create(sizeHint: int, segmentCount: int) =
+            // Size bitmap for expected strings
+            let bitmapSize = max 1024 ((sizeHint * 2) / 64)
+            let bitmap = Array.zeroCreate bitmapSize
+            
+            // Create segments
+            let segmentSize = max 64 (sizeHint / segmentCount / 2)  // 50% load factor
+            let segments = Array.init segmentCount (fun _ -> 
+                HashTableSegment.Create(segmentSize)
+            )
+            
+            // Calculate segment shift (for power-of-2 segment count)
+            let segmentBits = 
+                let rec countBits n acc = 
+                    if n <= 1 then acc else countBits (n >>> 1) (acc + 1)
+                countBits segmentCount 0
+            
+            {
+                Bitmap = bitmap
+                BitmapMask = uint64 (bitmap.Length * 64 - 1)
+                Segments = segments
+                SegmentCount = segmentCount
+                SegmentShift = 64 - segmentBits
+                GlobalStats = { TotalLookups = 0L; Hits = 0L; Misses = 0L; 
+                               FalsePositives = 0L; Collisions = 0L }
+            }
+        
+        /// Get segment index from hash
+        [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+        member inline private this.GetSegmentIndex(hash: uint64) =
+            int (hash >>> this.SegmentShift)
+        
+        /// Check if string exists and return location
+        member this.TryGetLocation(str: string) : StringLocation option =
+            let hash = fnv1aHash str
+            
+            // Check bloom filter first
+            let bitIndex = int (hash &&& this.BitmapMask)
+            let wordIndex = bitIndex >>> 6
+            let bitMask = 1L <<< (bitIndex &&& 63)
+            
+            Interlocked.Increment(&this.GlobalStats.TotalLookups) |> ignore
+            
+            let word = Volatile.Read(&this.Bitmap.[wordIndex])
+            if (word &&& bitMask) = 0L then
+                // Definitely not present
+                Interlocked.Increment(&this.GlobalStats.Misses) |> ignore
+                None
+            else
+                // Possibly present - check hash table
+                Interlocked.Increment(&this.GlobalStats.Hits) |> ignore
+                
+                // Select segment
+                let segmentIdx = this.GetSegmentIndex(hash)
+                let segment = this.Segments.[segmentIdx]
+                
+                // Hash within segment
+                let hashFragment = uint32 (hash >>> 32)
+                let localSlot = int (hash % uint64 segment.SegmentSize)
+                
+                // Probe within segment
+                let maxDistance = min 16s (int16 (segment.SegmentSize / 4))
+                let result = segment.ProbeLocal(hashFragment, localSlot, maxDistance)
+                
+                if result.IsNone then
+                    Interlocked.Increment(&this.GlobalStats.FalsePositives) |> ignore
+                
+                result
+        
+        /// Add string with location
+        member this.AddString(str: string, arrayType: byte, stringIndex: int32, entryIndex: int32) : bool =
+            let hash = fnv1aHash str
+            
+            // Set bloom filter bit
+            let bitIndex = int (hash &&& this.BitmapMask)
+            let wordIndex = bitIndex >>> 6
+            let bitMask = 1L <<< (bitIndex &&& 63)
+            
+            let wasSet = (Interlocked.Or(&this.Bitmap.[wordIndex], bitMask) &&& bitMask) <> 0L
+            
+            // Select segment
+            let segmentIdx = this.GetSegmentIndex(hash)
+            let segment = this.Segments.[segmentIdx]
+            
+            // Create location
+            let location = { 
+                ArrayType = arrayType
+                StringIndex = stringIndex
+                EntryIndex = entryIndex 
+            }
+            
+            // Insert into segment
+            let hashFragment = uint32 (hash >>> 32)
+            let localSlot = int (hash % uint64 segment.SegmentSize)
+            
+            let inserted = segment.InsertLocal(hashFragment, location, localSlot)
+            
+            if not inserted then
+                // Segment full - could trigger resize here
+                Interlocked.Increment(&segment.Stats.Collisions) |> ignore
+            
+            not wasSet && inserted
+        
+        /// Get combined statistics
+        member this.GetStats() =
+            let mutable totalLookups = this.GlobalStats.TotalLookups
+            let mutable totalHits = this.GlobalStats.Hits
+            let mutable totalCollisions = 0L
+            
+            // Aggregate segment stats
+            for segment in this.Segments do
+                totalCollisions <- totalCollisions + segment.Stats.Collisions
+            
+            let hitRatio = 
+                if totalLookups > 0L then 
+                    float totalHits / float totalLookups 
+                else 0.0
+            
+            let collisionRate = 
+                if totalHits > 0L then 
+                    float totalCollisions / float totalHits 
+                else 0.0
+            
+            hitRatio, collisionRate
+2. Updated Pool Integration
+fsharp// In Pool type
+type Pool = {
+    // Existing fields...
+    EdenArray: PackedPoolArray
+    PostEden: Segments
+    
+    // Enhanced filter with configurable segments
+    StringFilter: SegmentedStringFilter
+    
+    // Rest of fields...
+} with
+    static member Create(baseId: int, edenSize: int, config: PoolConfiguration) =
+        // Calculate segment count based on expected concurrency
+        let segmentCount = 
+            match config with
+            | cfg when cfg.GlobalEdenSize >= 50000 -> 64  // High performance
+            | cfg when cfg.GlobalEdenSize >= 10000 -> 16  // Default
+            | _ -> 8  // Low memory
+        
+        // Create enhanced filter
+        let expectedStrings = edenSize * 3
+        let stringFilter = SegmentedStringFilter.Create(expectedStrings, segmentCount)
+        
+        // Create post-eden with filter reference
+        let postEden = Segments.Create(baseId + edenSize, config)
+        postEden.SetStringFilter(stringFilter)
+        
+        {
+            EdenArray = {
+                PackedEntries = Array.zeroCreate edenSize
+                StringsArray = Array.zeroCreate edenSize
+                NextStringIndex = 0
+            }
+            PostEden = postEden
+            StringFilter = stringFilter
+            // ... rest of initialization
+        }
+3. Updated Segments Integration
+fsharp// In Segments type
+type Segments = {
+    // Existing fields...
+    
+    // Reference to shared filter
+    StringFilter: SegmentedStringFilter option
+} with
+    member this.SetStringFilter(filter: SegmentedStringFilter) =
+        this.StringFilter <- Some filter
+    
+    member this.AllocateString(str: string, baseId: int) : StringId =
+        // Try filter first
+        match this.StringFilter with
+        | Some filter ->
+            match filter.TryGetLocation(str) with
+            | Some location when location.ArrayType > 0uy ->
+                // Check if it's in our segments
+                let segmentIdx = int location.ArrayType - 1
+                if segmentIdx < this.Chunks.Count then
+                    let chunk = this.Chunks.[segmentIdx]
+                    if location.StringIndex < chunk.NextStringIndex then
+                        let storedStr = Volatile.Read(&chunk.StringsArray.[location.StringIndex])
+                        if storedStr = str then
+                            // Verify entry still valid
+                            let offset = location.EntryIndex
+                            if offset >= 0 && offset < chunk.PackedEntries.Length then
+                                let packed = Volatile.Read(&chunk.PackedEntries.[offset])
+                                if not (PackedOps.isPromoted packed) then
+                                    // Found it - return existing ID
+                                    let id = StringId.Create(baseId + (segmentIdx * this.ChunkSize) + offset)
+                                    
+                                    // Update temperature
+                                    let newId = id.IncrementTemperature()
+                                    if newId.Temperature = this.PromotionThreshold then
+                                        this.PromotionTracker.SignalPromotion(newId, newId.Temperature) |> ignore
+                                    
+                                    return newId
+            | _ -> ()
+        | None -> ()
+        
+        // Not found - allocate new
+        // ... rest of existing allocation logic
+4. Key Configuration Addition
+fsharptype PoolConfiguration = {
+    // Existing fields...
+    
+    // Segmentation configuration
+    FilterSegmentCount: int  // Number of segments in filter
+} with
+    static member Default = {
+        // Existing defaults...
+        FilterSegmentCount = 16
+    }
+    
+    static member HighPerformance = {
+        // Existing...
+        FilterSegmentCount = 64  // More segments for high concurrency
+    }
+5. Benefits of This Design
+
+Bounded Search: Robin Hood hashing ensures maximum probe distance
+Segment Isolation: Each segment can be probed independently (better cache locality)
+Reduced Contention: Operations distributed across segments
+Gradual Degradation: If one segment fills up, others still perform well
+Compatible: Works seamlessly with existing packed array design
+
+The key improvements are:
+
+Segmented design reduces contention
+Robin Hood hashing bounds worst-case probe distance
+Bloom filter still provides fast rejection
+Each segment is cache-line friendly
+No global locks except for rare resize operations
+RetryTWhat are the advantages of the robin-hood approach over the hopscotch hashing, apart from the extra 4 bytes of overhead per bucket? How much poorer is the cache locality in that approach?We now have a wealth of bucket configurations to contend with, and tuning the system is becoming increasingly complex.  Also you have reintroduced a lock during resizing, which is unacceptable... Our design already has to contend with a lock when the chunks in Segments need resizing.Let's go back to the drawing board. The bitmap index works well for identifying whether or not we recognise a string by its hash, and we can store the locations in an array of hash entries currently, but we have to do linear search to find the locations when we recognise a bitmap, thus the speed and efficiency of the index is somewhat wasted.Let's look at the cost of our implementation choices against the broader cost of the overall solution. We want to minimise GC churn for strings, however we cannot simply use a concurrent dictionary, because the convoy effect leads to thread starvation. We have an elegant O(1) lookup into arrays for based on string id, but we need a reverse mapping to the strings.We could use a concurrent trie, however the allocation churn of creating and destroying intermediate nodes could potentially cause the same GC problems we are trying to avoid.Let me add some further constraints so we can arrive at the right answer:A further layer of segmentation is fine, but the sizing needs to be automated. If sizing will impact on the performance or space usage, then the configuration supplied need to be an heuristic to determine the right number of segments based on other sizing factors already in our config set.No locking is permitted - the design must remain lock free. We can tolerate duplication of data during writes, however reads must return the correct data (even if there is some duplication)We remain on the hot path for code that is processing data and producing RDF from RML mappings, therefore throughput is second only the space efficiency.We do want to minimise the impact on our existing design (of Segments and Pool), however if it is necessary to refactor those in order to get an optimistic lock-free solution, that is better than introducing locks "lower down". Please take your time and think carefully. Let's analyse what our options are here. We need to know if we've cached a string before, and fast hashing is sufficient to check a bitmap for the string to see if it's known already, however we need a way to look up the location of a string id IF we do recognise it. And we cannot damage the integrity of stored string ids, that need to provide ongoing temperature checks and participate properly in promotion across tiers.EditYou're absolutely right - let's step back and analyze this more carefully. The core insight is that we need a lock-free reverse mapping (string → location) that doesn't compromise our existing O(1) forward mapping (ID → string).
+Core Problem Analysis
+We have:
+
+Fast rejection via bitmap (works well)
+O(1) forward lookup via packed arrays (works well)
+Missing: Efficient reverse lookup when bitmap says "maybe present"
+
+Key Constraints Restated
+
+No locks (even during resize)
+Tolerate duplicate entries (eventual consistency)
+Minimize allocations (no GC churn)
+Maintain temperature tracking and promotion
+Automated sizing (no manual tuning)
+
+Option Analysis
+Option 1: Fixed-Size Hash Array with Overflow Chaining
+Instead of probing, use a fixed array where each slot can hold multiple entries:
+fsharptype HashSlot = {
+    // Fixed-size array of entries (e.g., 4 entries per slot)
+    Entries: HashEntry[]
+    // Overflow to next slot index (-1 if none)
+    mutable OverflowIndex: int32
+}
+Problem: Still needs memory allocation for overflow, potential cache misses.
+Option 2: Hierarchical Bitmap Index
+Use multiple levels of bitmaps to progressively narrow the search:
+fsharptype HierarchicalBitmap = {
+    Level1: int64[]  // Coarse (1 bit per 64 strings)
+    Level2: int64[]  // Medium (1 bit per 8 strings)
+    Level3: int64[]  // Fine (1 bit per string)
+    Locations: StringLocation[]  // Actual locations
+}
+Problem: Complex indexing logic, still doesn't solve the location lookup.
+Option 3: Direct-Mapped Location Array
+This is my recommendation - use the hash directly as an index into a location array:
+fsharptype DirectMappedIndex = {
+    // Bloom filter for fast rejection
+    Bitmap: int64[]
+    
+    // Direct-mapped array: hash % size → location
+    // Multiple strings can map to same slot (we store the most recent)
+    LocationArray: StringLocation[]
+    
+    // Verification: store hash fragment to detect collisions
+    HashFragments: uint32[]
+}
+Here's why this works:
+
+No search needed - hash directly gives array index
+Collision handling - we verify with stored hash fragment
+Duplication tolerance - if collision occurs, we just allocate a new ID
+Lock-free - only atomic writes needed
+
+Option 4: Content-Addressable Packed Arrays
+Alternative approach - make the packed arrays themselves content-addressable:
+Instead of allocating strings sequentially, use hash-based allocation:
+fsharptype ContentAddressablePool = {
+    PackedEntries: int64[]
+    StringsArray: string[]
+    
+    // Allocation based on hash
+    member this.AllocateString(str: string) =
+        let hash = fnv1aHash str
+        let baseIndex = int (hash % uint64 this.PackedEntries.Length)
+        
+        // Find free slot near hash position
+        let slot = this.FindFreeSlotNear(baseIndex)
+        // ...
+}
+Recommended Solution: Hybrid Direct-Mapped Index
+Combining the best aspects:
+fsharptype HybridStringIndex = {
+    // Bloom filter (unchanged)
+    Bitmap: int64[]
+    BitmapMask: uint64
+    
+    // Direct-mapped location array
+    LocationArray: StringLocation[]
+    HashFragments: uint32[]
+    ArrayMask: int32
+    
+    // Stats
+    mutable Stats: FilterStats
+}
+
+member this.TryGetLocation(str: string) : StringLocation option =
+    let hash = fnv1aHash str
+    
+    // 1. Check bloom filter (fast rejection)
+    let bitIndex = int (hash &&& this.BitmapMask)
+    if not (this.CheckBitmap(bitIndex)) then
+        None
+    else
+        // 2. Direct lookup in location array
+        let arrayIndex = int (hash % uint64 this.LocationArray.Length)
+        let location = Volatile.Read(&this.LocationArray.[arrayIndex])
+        let hashFragment = Volatile.Read(&this.HashFragments.[arrayIndex])
+        
+        // 3. Verify hash match
+        if hashFragment = uint32 (hash >>> 32) && location.ArrayType <> 0uy then
+            Some location
+        else
+            None  // Collision or not found
+
+member this.AddString(str: string, location: StringLocation) =
+    let hash = fnv1aHash str
+    
+    // Set bitmap
+    this.SetBitmap(int (hash &&& this.BitmapMask))
+    
+    // Direct store (last writer wins)
+    let arrayIndex = int (hash % uint64 this.LocationArray.Length)
+    Volatile.Write(&this.HashFragments.[arrayIndex], uint32 (hash >>> 32))
+    Thread.MemoryBarrier()
+    Volatile.Write(&this.LocationArray.[arrayIndex], location)
+Automated Sizing Strategy
+fsharplet calculateIndexSize (config: PoolConfiguration) =
+    // Base size on expected total strings
+    let expectedStrings = 
+        config.GlobalEdenSize + 
+        config.GroupEdenSize * 10 +  // Assume 10 groups
+        config.WorkerEdenSize * 100  // Assume 100 workers
+    
+    // Direct-mapped array should be 2-4x expected size for low collision rate
+    let loadFactor = 
+        match config with
+        | cfg when cfg = PoolConfiguration.HighPerformance -> 0.25  // 25% load
+        | cfg when cfg = PoolConfiguration.LowMemory -> 0.75       // 75% load
+        | _ -> 0.5  // 50% load
+    
+    let arraySize = int (float expectedStrings / loadFactor)
+    
+    // Round up to power of 2 for fast modulo
+    let rec nextPow2 n = 
+        if n &&& (n - 1) = 0 then n else nextPow2 (n + 1)
+    
+    nextPow2 arraySize
+Integration with Existing Design
+The beauty of this approach is minimal changes:
+fsharp// In Pool/Segments
+member this.AllocateString(str: string, baseId: int) : StringId =
+    // Check index first
+    match this.StringIndex.TryGetLocation(str) with
+    | Some location ->
+        // Verify it's still valid and not promoted
+        match this.VerifyLocation(location) with
+        | Some existingId -> 
+            // Found - update temperature
+            existingId.IncrementTemperature()
+        | None ->
+            // Location invalid (promoted/evicted) - allocate new
+            this.AllocateNew(str, baseId)
+    | None ->
+        // Not found - allocate new
+        let id = this.AllocateNew(str, baseId)
+        let location = this.IdToLocation(id)
+        this.StringIndex.AddString(str, location)
+        id
+Why This Works
+
+No locks - only atomic reads/writes
+Bounded memory - array size is fixed
+O(1) operations - direct array access
+Collision tolerant - duplicates are OK
+Cache friendly - sequential memory access
+GC friendly - no allocations after initialization
+
+Trade-offs
+
+Collision rate: With 2-4x sizing, collision rate stays under 25-50%
+Memory overhead: ~16 bytes per slot (whether used or not)
+Duplication: Some strings may be allocated multiple times (acceptable)
+
+This gives us the best balance of:
+
+Simplicity (no complex probing)
+Performance (true O(1))
+Lock-freedom (no coordination needed)
+Integration (minimal changes to existing code)
