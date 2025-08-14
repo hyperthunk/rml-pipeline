@@ -8,6 +8,7 @@
         open RMLPipeline.Tests.StringPoolIntegrationTests
         open RMLPipeline.Tests.PlannerModelTests
         open RMLPipeline.Tests.TypeLevelTests
+        open RMLPipeline.Tests.BitmapIndexTests
         // open RMLPipeline.Tests.PipelineModelBased
 
         [<EntryPoint>]
@@ -18,9 +19,19 @@
                 pipelineModelBasedTests                    
             ] *)
 
+
+            (*
+            
+                cover123 a Cover
+                cover123 clauseName "abc"
+                cover123 hasLimit limit123            
+            
+            *)
+
             let allTests = 
                 testList "RMLPipeline" [
-                    TypeLevelTests.allTests
+                    typeLevelTests
+                    bitmapIndexTests
                     allStringInterningTests
                     allStringPoolIntegrationTests
                     allComputationRMLTests

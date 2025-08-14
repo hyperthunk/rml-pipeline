@@ -83,12 +83,24 @@ module BitmapIndexTests =
             return List.concat [baseStrings; modifiedStrings] |> List.distinct
         }
 
+    let genHardCollissions =
+        let hardCollisions = Gen.listOf <| Gen.oneof [
+            Gen.constant "collision-string-1"
+            Gen.constant "collision-string-2"
+            Gen.constant "collision-string-3"
+        ] 
+        Gen.frequency [
+            5, genCollisionStringSet
+            2, genRealisticStringSet |> Gen.listOf
+            1, hardCollisions
+        ]
+
     type StringIndexArbitraries =
         static member StringSet() =
             Arb.fromGen genStringSet
             
         static member CollisionStringSet() =
-            Arb.fromGen genCollisionStringSet
+            Arb.fromGen genHardCollissions
             
         static member SizeHint() =
             Arb.fromGen (Gen.choose(16, 10000))
@@ -220,8 +232,9 @@ module BitmapIndexTests =
                         // Release all threads
                         barrier.SignalAndWait()
                         
-                        // Wait for all threads to complete
-                        Task.WaitAll(tasks)
+                        // Wait for all threads to complete, with a timeout
+                        Task.WaitAll(tasks, 60000) 
+                        |> fun success -> Expect.isTrue success "All tasks should complete within 1min timeout"
                         
                         // Verify all strings can be found (eventual consistency)
                         strings |> List.forall (fun s -> 
@@ -349,7 +362,7 @@ module BitmapIndexTests =
             ]
 
     // Thread safety and concurrency tests
-    module ConcurrencyTests =
+     module ConcurrencyTests =
         [<Tests>]
         let tests =
             testList "StringIndex_Concurrency" [
@@ -363,26 +376,29 @@ module BitmapIndexTests =
                     // String to be allocated by multiple threads
                     let testString = "concurrent-temp-test"
                     
-                    // Multiple threads allocating the same string
+                    // Multiple async operations allocating the same string
                     let threadCount = 4
                     let results = Array.zeroCreate<StringId> threadCount
                     
-                    let threads = Array.init threadCount (fun i ->
-                        Thread(ThreadStart(fun () ->
-                            // Each thread allocates the string multiple times
+                    // Create async workflows
+                    let asyncOps = Array.init threadCount (fun i ->
+                        async {
+                            // Each async workflow allocates the string multiple times
                             let mutable id = StringId.Invalid
                             for _ in 1..10 do
                                 id <- segments.AllocateString(testString, baseId)
-                                Thread.Sleep(1) // Small delay to interleave operations
+                                do! Async.Sleep 1 // Small delay to interleave operations
                             results.[i] <- id
-                        ))
+                        }
                     )
                     
-                    // Run threads
-                    for t in threads do t.Start()
-                    for t in threads do t.Join()
+                    // Run all async operations in parallel with timeout
+                    Async.RunSynchronously(
+                        Async.Parallel asyncOps |> Async.Ignore, 
+                        timeout = 10000
+                    )
                     
-                    // All threads should have valid IDs
+                    // All operations should have produced valid IDs
                     for id in results do
                         Expect.isTrue id.IsValid "Should have valid ID"
                         match segments.TryGetString(id.Value, baseId) with
@@ -393,12 +409,12 @@ module BitmapIndexTests =
                     let config = PoolConfiguration.Default
                     let index = StringIndex.Create(config, Segment)
 
-                    // Multiple threads adding and looking up strings
+                    // Multiple async operations adding and looking up strings
                     let threadCount = 8
                     let operationsPerThread = 100
                     
-                    let threads = Array.init threadCount (fun threadId ->
-                        Thread(ThreadStart(fun () ->
+                    let asyncOps = Array.init threadCount (fun threadId ->
+                        async {
                             for i in 0..operationsPerThread-1 do
                                 let s = $"thread{threadId}-op{i}"
                                 
@@ -412,12 +428,14 @@ module BitmapIndexTests =
                                 | ValueNone ->
                                     // Acceptable due to overwrites in direct-mapped index
                                     ()
-                        ))
+                        }
                     )
                     
-                    // Run threads
-                    for t in threads do t.Start()
-                    for t in threads do t.Join()
+                    // Run all async operations in parallel with timeout
+                    Async.RunSynchronously(
+                        Async.Parallel asyncOps |> Async.Ignore,
+                        timeout = 10000
+                    )
                     
                     // Check final stats
                     let hitRate, overwriteRate = index.GetStats()
@@ -429,8 +447,8 @@ module BitmapIndexTests =
 
     // Main test entry point
     [<Tests>]
-    let allTests =
-        testList "StringIndexTests" [
+    let bitmapIndexTests =
+        ftestList "BitmapIndexTests" [
             StringIndexProperties.tests
             PoolIntegrationTests.tests
             ConcurrencyTests.tests

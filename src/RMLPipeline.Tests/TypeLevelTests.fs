@@ -341,7 +341,7 @@ module TypeLevelTests =
 
     // Main test entry point
     [<Tests>]
-    let allTests =
+    let typeLevelTests =
         testList "TypeLevelTests" [
             StringIdProperties.tests
             PromotionTrackerProperties.tests

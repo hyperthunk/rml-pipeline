@@ -360,18 +360,6 @@ module StringInterning =
                 StringIndex = int32 ((packed >>> 32) &&& 0xFFFFFFL)
                 EntryIndex = int32 (packed &&& 0xFFFFFFFFL)
             }
-        
-        (* [<Struct>]
-        type HashEntry = {
-            /// Upper 32 bits of hash (for fast comparison)
-            HashFragment: uint32
-            /// Direct location information
-            Location: StringLocation
-            /// Distance from ideal position (for Robin Hood hashing)
-            Distance: int16
-            /// For lock-free insertion - 0 means empty slot
-            mutable State: int32
-        } *)
 
         let inline fnv1aHash (str: string) : uint64 =
             let prime = 1099511628211UL
@@ -419,8 +407,13 @@ module StringInterning =
                 let arraySize = 
                     let size = int (float expectedSize / loadFactor)
                     // Round to power of 2
-                    let rec nextPow2 n = 
-                        if n &&& (n - 1) = 0 then n else nextPow2 (n + 1)
+                    let nextPow2 n =
+                        if n <= 0 then 1
+                        else
+                            let mutable power = 1
+                            while power < n do
+                                power <- power <<< 1
+                            power
                     nextPow2 (max 256 size)
                 
                 // Bitmap size (1 bit per potential string)
@@ -451,29 +444,31 @@ module StringInterning =
                 (Volatile.Read(&this.Bitmap.[wordIndex]) &&& bitMask) <> 0L
             
             member this.TryGetLocation(str: string) : PackedLocation voption =
-                Interlocked.Increment(&this.Stats.Lookups) |> ignore
-                
-                let hash = fnv1aHash str
-                
-                if not (this.CheckIndexBit hash) then
-                    Interlocked.Increment(&this.Stats.Misses) |> ignore
+                if String.IsNullOrEmpty str then
                     ValueNone
                 else
-                    let index = int (hash &&& this.ArrayMask)
-                    let hashFragment = uint32 (hash >>> 32)
+                    Interlocked.Increment(&this.Stats.Lookups) |> ignore                
+                    let hash = fnv1aHash str
                     
-                    let storedFragment = Volatile.Read(&this.HashFragments.[index])
-                    if storedFragment = hashFragment then
-                        let packed = Volatile.Read(&this.PackedLocations.[index])
-                        if packed <> 0L then  // 0 = invalid/empty
-                            Interlocked.Increment(&this.Stats.Hits) |> ignore
-                            ValueSome (unpackLocation packed)
+                    if not (this.CheckIndexBit hash) then
+                        Interlocked.Increment(&this.Stats.Misses) |> ignore
+                        ValueNone
+                    else
+                        let index = int (hash &&& this.ArrayMask)
+                        let hashFragment = uint32 (hash >>> 32)
+                        
+                        let storedFragment = Volatile.Read(&this.HashFragments.[index])
+                        if storedFragment = hashFragment then
+                            let packed = Volatile.Read(&this.PackedLocations.[index])
+                            if packed <> 0L then  // 0 = invalid/empty
+                                Interlocked.Increment(&this.Stats.Hits) |> ignore
+                                ValueSome (unpackLocation packed)
+                            else
+                                Interlocked.Increment(&this.Stats.Misses) |> ignore
+                                ValueNone
                         else
                             Interlocked.Increment(&this.Stats.Misses) |> ignore
                             ValueNone
-                    else
-                        Interlocked.Increment(&this.Stats.Misses) |> ignore
-                        ValueNone
             
             member this.AddLocation(
                             str: string, 
