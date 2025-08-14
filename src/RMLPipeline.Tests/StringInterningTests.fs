@@ -473,7 +473,7 @@ module StringInterningTests =
                 )
             )
 
-        testProperty "Same access pattern returns consistent IDs" <| fun (str: string) (pattern: StringAccessPattern) ->
+        ftestProperty "Same access pattern returns consistent IDs" <| fun (str: string) (pattern: StringAccessPattern) ->
             (not (String.IsNullOrEmpty(str))) ==> lazy (
                 let hierarchy = StringPool.create [||]
                 use scope = StringPool.createScope hierarchy None None

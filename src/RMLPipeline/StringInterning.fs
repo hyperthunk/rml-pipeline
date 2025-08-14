@@ -318,13 +318,12 @@ module StringInterning =
 
     (* Efficient, lock-free indexing *)
     module HashIndexing = 
-
         [<Struct>]
         type IndexStats = {
             mutable Lookups: int64
             mutable Hits: int64
             mutable Misses: int64
-            mutable Overwrites: int64
+            mutable Collisions: int64
         }
 
         [<Struct>]
@@ -336,13 +335,15 @@ module StringInterning =
             Collisions: int64  
         }
         
-        // Pack/unpack helpers
         [<Struct>]
         type PackedLocation = {
             ArrayType: byte      // 8 bits
             StringIndex: int32   // 24 bits (16M strings per array)
             EntryIndex: int32    // 32 bits
         }
+
+        // A sentinel value for "empty" locations
+        let EmptyLocationValue = -1L
         
         let inline packLocation (arrayType: byte) (stringIndex: int32) (entryIndex: int32) : int64 =
             // Validate ranges
@@ -372,21 +373,42 @@ module StringInterning =
             
             hash
 
+        /// Number of shards to use - must be a power of 2
+        [<Literal>]
+        let private NumShards = 32  // No lower than 32 to avoid excessive collisions
+
+        /// Mask for selecting a shard (NumShards - 1)
+        [<Literal>]
+        let private ShardMask = 0x1FUL  // 31 in hex (for 32 shards)
+
+        /// Bits to shift hash by when indexing into bitmap or array
+        [<Literal>]
+        let private ShardShift = 5  // log2(NumShards)
+
+        /// Single shard for the sharded hash table
+        [<Struct>]
+        type ShardData = {
+            Bitmap: int64[]          // Bitmap for quick existence checks
+            BitmapMask: uint64       // Mask for bitmap indexing
+            PackedLocations: int64[] // Locations of strings
+            HashFragments: uint32[]  // Hash fragments to detect collisions
+            StringKeys: string[]     // Actual string keys for verifying exact matches
+            ArrayMask: uint64        // Mask for array indexing
+        }
+
+        open System.Collections.Concurrent
+
         (* 
-            Index from String to PackedLocations. 
-            This implementation is lock-free and provides optimistic
-            concurrency (with atomic operations allowing for duplicate entries).            
+            Sharded index from String to PackedLocations.
+            This implementation distributes strings across multiple shards
+            to minimize collisions. In case of collisions, it uses an overflow
+            dictionary as a safety net.
         *)        
         type StringIndex = {
-            Bitmap: int64[]          // Bitmap index for fast existence checks
-            BitmapMask: uint64       // Mask for indexing into bitmap
-                        
-            PackedLocations: int64[] // Hash entries for string locations
-            HashFragments: uint32[]
-            ArrayMask: uint64
-            
-            // stats housekeeping
-            mutable Stats: IndexStats
+            Shards: ShardData[]      // The individual shards
+            // Safety net for collision handling
+            OverflowLocations: ConcurrentDictionary<string, int64>
+            mutable Stats: IndexStats // Aggregated statistics
         } with
             static member Create(config: PoolConfiguration, poolType: PoolType) =
                 // Calculate size based on pool type and config
@@ -397,113 +419,185 @@ module StringInterning =
                     | Worker -> config.WorkerEdenSize * 2
                     | Segment -> 1000
                 
-                // Use load factor based on performance profile
-                let loadFactor = 
-                    match config with
-                    | cfg when cfg.GlobalEdenSize >= 50000 -> 0.25  // High performance
-                    | cfg when cfg.GlobalEdenSize <= 10000 -> 0.75  // Low memory
-                    | _ -> 0.5  // Default
+                // Use a very low load factor to minimize collisions
+                let loadFactor = 0.15  // 15% load factor to minimize collision probability
                 
-                let arraySize = 
-                    let size = int (float expectedSize / loadFactor)
-                    // Round to power of 2
-                    let nextPow2 n =
-                        if n <= 0 then 1
-                        else
-                            let mutable power = 1
-                            while power < n do
-                                power <- power <<< 1
-                            power
-                    nextPow2 (max 256 size)
+                // Size per shard is total size / number of shards
+                let sizePerShard = int (float expectedSize / float NumShards / loadFactor)
                 
-                // Bitmap size (1 bit per potential string)
-                let bitmapSize = max 64 (arraySize / 64)
-                {
-                    Bitmap = Array.zeroCreate bitmapSize
-                    BitmapMask = uint64 (bitmapSize * 64 - 1)
-                    PackedLocations = Array.zeroCreate arraySize  // All zeros = invalid
-                    HashFragments = Array.zeroCreate arraySize
-                    ArrayMask = uint64 (arraySize - 1)
-                    Stats = { Lookups = 0L; Hits = 0L; Misses = 0L; Overwrites = 0L }
+                // Round to power of 2
+                let nextPow2 n =
+                    if n <= 0 then 1
+                    else
+                        let mutable power = 1
+                        while power < n do
+                            power <- power <<< 1
+                        power
+                        
+                let arraySize = nextPow2 (max 256 sizePerShard)
+                
+                // Create shards
+                let shards = Array.init NumShards (fun _ ->
+                    let bitmapSize = max 64 (arraySize / 64)
+                    {
+                        Bitmap = Array.zeroCreate bitmapSize
+                        BitmapMask = uint64 (bitmapSize * 64 - 1)
+                        PackedLocations = Array.create arraySize EmptyLocationValue
+                        HashFragments = Array.zeroCreate arraySize
+                        StringKeys = Array.create arraySize null
+                        ArrayMask = uint64 (arraySize - 1)
+                    })
+                
+                { 
+                    Shards = shards
+                    OverflowLocations = ConcurrentDictionary<string, int64>()
+                    Stats = { Lookups = 0L; Hits = 0L; Misses = 0L; Collisions = 0L }
                 }
 
-            (* Set and get the bit used for indexing in index *)
+            /// Get the shard index for a given hash
+            [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+            member inline private this.GetShardIndex(hash: uint64) : int =
+                // Use the lower bits of the hash to select shard
+                int (hash &&& ShardMask)
             
+            /// Set a bit in the bitmap for the appropriate shard
             [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
             member inline private this.SetIndexBit(hash: uint64) =
-                let bitIndex = int (hash &&& this.BitmapMask)
+                let shardIndex = this.GetShardIndex(hash)
+                let shard = this.Shards.[shardIndex]
+                
+                let bitIndex = int ((hash >>> ShardShift) &&& shard.BitmapMask)
                 let wordIndex = bitIndex >>> 6
                 let bitMask = 1L <<< (bitIndex &&& 63)
-                Interlocked.Or(&this.Bitmap.[wordIndex], bitMask) |> ignore
+                
+                Interlocked.Or(&shard.Bitmap.[wordIndex], bitMask) |> ignore
             
+            /// Check if a bit is set in the bitmap for the appropriate shard
             [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
             member inline private this.CheckIndexBit(hash: uint64) =
-                let bitIndex = int (hash &&& this.BitmapMask)
+                let shardIndex = this.GetShardIndex(hash)
+                let shard = this.Shards.[shardIndex]
+                
+                let bitIndex = int ((hash >>> ShardShift) &&& shard.BitmapMask)
                 let wordIndex = bitIndex >>> 6
                 let bitMask = 1L <<< (bitIndex &&& 63)
-                (Volatile.Read(&this.Bitmap.[wordIndex]) &&& bitMask) <> 0L
+                
+                (Volatile.Read(&shard.Bitmap.[wordIndex]) &&& bitMask) <> 0L
             
             member this.TryGetLocation(str: string) : PackedLocation voption =
                 if String.IsNullOrEmpty str then
                     ValueNone
                 else
                     Interlocked.Increment(&this.Stats.Lookups) |> ignore                
-                    let hash = fnv1aHash str
                     
-                    if not (this.CheckIndexBit hash) then
-                        Interlocked.Increment(&this.Stats.Misses) |> ignore
-                        ValueNone
-                    else
-                        let index = int (hash &&& this.ArrayMask)
-                        let hashFragment = uint32 (hash >>> 32)
+                    // First, try the overflow dictionary (for collision cases)
+                    match this.OverflowLocations.TryGetValue(str) with
+                    | true, packed -> 
+                        Interlocked.Increment(&this.Stats.Hits) |> ignore
+                        ValueSome (unpackLocation packed)
+                    | false, _ ->
+                        // Not in overflow, try the main index
+                        let hash = fnv1aHash str
                         
-                        let storedFragment = Volatile.Read(&this.HashFragments.[index])
-                        if storedFragment = hashFragment then
-                            let packed = Volatile.Read(&this.PackedLocations.[index])
-                            if packed <> 0L then  // 0 = invalid/empty
-                                Interlocked.Increment(&this.Stats.Hits) |> ignore
-                                ValueSome (unpackLocation packed)
-                            else
-                                Interlocked.Increment(&this.Stats.Misses) |> ignore
-                                ValueNone
-                        else
+                        if not (this.CheckIndexBit hash) then
                             Interlocked.Increment(&this.Stats.Misses) |> ignore
                             ValueNone
+                        else
+                            // Get appropriate shard and index
+                            let shardIndex = this.GetShardIndex(hash)
+                            let shard = this.Shards.[shardIndex]
+                            
+                            let index = int ((hash >>> ShardShift) &&& shard.ArrayMask)
+                            let hashFragment = uint32 (hash >>> 32)
+                            
+                            // Check hash fragment and verify the exact string
+                            let storedFragment = Volatile.Read(&shard.HashFragments.[index])
+                            if storedFragment = hashFragment then
+                                let storedStr = Volatile.Read(&shard.StringKeys.[index])
+                                
+                                // Check for exact string match (not just hash match)
+                                if storedStr = str then
+                                    let packed = Volatile.Read(&shard.PackedLocations.[index])
+                                    if packed <> EmptyLocationValue then
+                                        // Found the string
+                                        Interlocked.Increment(&this.Stats.Hits) |> ignore
+                                        ValueSome (unpackLocation packed)
+                                    else
+                                        // Empty slot (unusual but possible with concurrent operations)
+                                        Interlocked.Increment(&this.Stats.Misses) |> ignore
+                                        ValueNone
+                                else
+                                    // Hash collision, but different string
+                                    Interlocked.Increment(&this.Stats.Misses) |> ignore
+                                    ValueNone
+                            else
+                                // Hash fragment mismatch
+                                Interlocked.Increment(&this.Stats.Misses) |> ignore
+                                ValueNone
             
             member this.AddLocation(
                             str: string, 
                             arrayType: byte, 
                             stringIndex: int32, 
                             entryIndex: int32) =
-                let hash = fnv1aHash str
+                if String.IsNullOrEmpty str then
+                    ()  // Don't add empty strings
+                else
+                    // Pack location data
+                    let packed = packLocation arrayType stringIndex entryIndex
+                    
+                    // Try the normal path first
+                    let hash = fnv1aHash str
+                    
+                    // Set bitmap bit
+                    this.SetIndexBit hash
+                    
+                    // Get appropriate shard
+                    let shardIndex = this.GetShardIndex(hash)
+                    let shard = this.Shards.[shardIndex]
+                    
+                    // Get index in the shard
+                    let index = int ((hash >>> ShardShift) &&& shard.ArrayMask)
+                    let hashFragment = uint32 (hash >>> 32)
+                    
+                    // Check if slot is empty
+                    let currentPacked = Volatile.Read(&shard.PackedLocations.[index])
+                    let currentStr = Volatile.Read(&shard.StringKeys.[index])
+                    
+                    if currentPacked = EmptyLocationValue || currentStr = null then
+                        // Try to atomically claim the empty slot
+                        // First set the string key (if it succeeds, proceed with the rest)
+                        if Interlocked.CompareExchange<string>(&shard.StringKeys.[index], str, null) = null then
+                            // We successfully claimed the slot, now set the hash and location
+                            Volatile.Write(&shard.HashFragments.[index], hashFragment)
+                            Thread.MemoryBarrier()
+                            Volatile.Write(&shard.PackedLocations.[index], packed)
+                        else
+                            // Another thread claimed this slot, handle as collision
+                            this.HandleCollision(str, packed)
+                    elif currentStr = str then
+                        // Slot already contains this string, just update the packed location
+                        Volatile.Write(&shard.PackedLocations.[index], packed)
+                    else
+                        // Collision with a different string, handle it
+                        this.HandleCollision(str, packed)
+            
+            /// Handle collision by storing in the overflow dictionary
+            member private this.HandleCollision(str: string, packed: int64) =
+                Interlocked.Increment(&this.Stats.Collisions) |> ignore
                 
-                this.SetIndexBit hash
-                
-                let index = int (hash &&& this.ArrayMask)
-                let hashFragment = uint32 (hash >>> 32)
-                
-                // Check for overwrites
-                let oldFragment = Volatile.Read &this.HashFragments.[index]
-                if oldFragment <> 0u && oldFragment <> hashFragment then
-                    Interlocked.Increment(&this.Stats.Overwrites) |> ignore
-                
-                // Pack location
-                let packed = packLocation arrayType stringIndex entryIndex
-                
-                // Write atomically
-                Volatile.Write(&this.HashFragments.[index], hashFragment)
-                Thread.MemoryBarrier()
-                Volatile.Write(&this.PackedLocations.[index], packed)
+                // Just add to the overflow dictionary (will replace if already exists)
+                this.OverflowLocations.[str] <- packed
             
             member this.GetStats() =
-                let lookups    = Volatile.Read &this.Stats.Lookups
-                let hits       = Volatile.Read &this.Stats.Hits
-                let overwrites = Volatile.Read &this.Stats.Overwrites
-
-                let hitRate = if lookups > 0L then float hits / float lookups else 0.0
-                let overwriteRate = if hits > 0L then float overwrites / float hits else 0.0
+                let lookups = Volatile.Read(&this.Stats.Lookups)
+                let hits = Volatile.Read(&this.Stats.Hits)
+                let collisions = Volatile.Read(&this.Stats.Collisions)
                 
-                hitRate, overwriteRate
+                let hitRate = if lookups > 0L then float hits / float lookups else 0.0
+                let collisionRate = if lookups > 0L then float collisions / float lookups else 0.0
+                
+                hitRate, collisionRate
         
     (* Promotion Across Tiers *)
     
@@ -573,12 +667,12 @@ module StringInterning =
                                     float Stopwatch.Frequency / 1000.0)
                 
                 if elapsed < minTicks then
-                    printfn "Skipping dequeue - not enough time since last processing"
+                    // printfn "Skipping dequeue - not enough time since last processing"
                     [||]  // Too soon
                 else
                     // Try to claim the promotion window
                     if Interlocked.CompareExchange(&this.LastProcessedTime, now, lastTime) <> lastTime then
-                        printfn "Skipping dequeue - another thread is processing"
+                        // printfn "Skipping dequeue - another thread is processing"
                         [||]  // Another thread is processing
                     else
                         // We have exclusive access to dequeue
@@ -586,7 +680,7 @@ module StringInterning =
                         let tail = Volatile.Read(&this.Tail)
                         let available = int (tail - head)
                         let toDequeue = min available maxCount
-                        printfn "Dequeueing %d items" toDequeue
+                        // printfn "Dequeueing %d items" toDequeue
                         if toDequeue > 0 then
                             let results = Array.zeroCreate toDequeue
                             for i = 0 to toDequeue - 1 do
@@ -645,7 +739,7 @@ module StringInterning =
                     // Try to claim the rotation
                     Interlocked.CompareExchange(&this.LastRotationTime, now, lastRotation) = lastRotation
                 else
-                    printfn "Not rotating epochs yet"
+                    // printfn "Not rotating epochs yet"
                     false
             
             // Process promotions - called periodically by promotion processing thread
@@ -653,7 +747,7 @@ module StringInterning =
             member this.ProcessPromotions(resolver: StringId -> string option) : PromotionCandidate[] =
                 // First check if we should rotate
                 if this.CheckRotation() then
-                    printfn "Rotating epochs"
+                    //printfn "Rotating epochs"
                     Interlocked.Increment(&this.CurrentWriteEpoch) |> ignore
                 
                 // Only one thread should process at a time
@@ -689,7 +783,7 @@ module StringInterning =
                     finally
                         Monitor.Exit this.ProcessingLock
                 else
-                    printfn "Skipping promotion processing - already in progress"
+                    // printfn "Skipping promotion processing - already in progress"
                     [||]  // Another thread is processing
 
         (* For use in single-threaded execution *)

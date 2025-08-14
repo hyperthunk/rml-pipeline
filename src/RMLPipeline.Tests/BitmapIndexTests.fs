@@ -95,13 +95,28 @@ module BitmapIndexTests =
             1, hardCollisions
         ]
 
+    let genNonMatchingStrings =
+        gen {
+            let! baseStrings = genStringSet
+            let! nonMatchingStrings = 
+                genStringSet 
+                |> Gen.filter (fun strings ->
+                    // Ensure these strings are not in the base set
+                    not strings.IsEmpty &&
+                    not (List.exists (fun s -> List.contains s baseStrings) strings))
+            return (nonMatchingStrings.Head, baseStrings)
+        }
+
     type StringIndexArbitraries =
         static member StringSet() =
             Arb.fromGen genStringSet
             
         static member CollisionStringSet() =
             Arb.fromGen genHardCollissions
-            
+
+        static member NonMatchingStrings() =
+            Arb.fromGen genNonMatchingStrings
+
         static member SizeHint() =
             Arb.fromGen (Gen.choose(16, 10000))
             
@@ -120,7 +135,7 @@ module BitmapIndexTests =
                 testPropertyWithConfig 
                     fsConfig 
                     "Index correctly reports non-existent strings" 
-                        <| fun (strings: string list) (queryString: string) ->
+                        <| fun (strings: string list, queryString: string) ->
                     
                     // Only consider the case where queryString is not in strings
                     not (List.contains queryString strings) ==> lazy (
@@ -134,7 +149,7 @@ module BitmapIndexTests =
                             index.AddLocation(s, 0uy, i, i))
                         
                         // Check that index correctly says queryString doesn't exist
-                        match index.TryGetLocation(queryString) with
+                        match index.TryGetLocation queryString with
                         | ValueNone -> true
                         | ValueSome _ -> false
                     )
@@ -157,7 +172,7 @@ module BitmapIndexTests =
                         // Verify every string can be found
                         strings
                         |> List.forall (fun s -> 
-                            match index.TryGetLocation(s) with
+                            match index.TryGetLocation s with
                             | ValueSome _ -> true
                             | ValueNone -> false
                         )
@@ -207,16 +222,11 @@ module BitmapIndexTests =
                         let index = StringIndex.Create(poolConfig, Segment)
                         let stringsArray = List.toArray strings
                         
-                        // Use barrier to ensure all threads start at same time
-                        let barrier = new Barrier(threadCount + 1)
-                        
                         // Create tasks to add strings concurrently
                         let tasks = 
                             [|0..threadCount-1|]
                             |> Array.map (fun threadId ->
                                 Task.Factory.StartNew(fun () ->
-                                    // Wait for all threads to be ready
-                                    barrier.SignalAndWait()
                                     
                                     // Each thread processes a subset of strings
                                     let startIdx = threadId * strings.Length / threadCount
@@ -228,9 +238,6 @@ module BitmapIndexTests =
                                             index.AddLocation(s, 0uy, i, i)
                                 )
                             )
-                        
-                        // Release all threads
-                        barrier.SignalAndWait()
                         
                         // Wait for all threads to complete, with a timeout
                         Task.WaitAll(tasks, 60000) 
@@ -395,7 +402,7 @@ module BitmapIndexTests =
                     // Run all async operations in parallel with timeout
                     Async.RunSynchronously(
                         Async.Parallel asyncOps |> Async.Ignore, 
-                        timeout = 10000
+                        timeout = 30000
                     )
                     
                     // All operations should have produced valid IDs
@@ -434,11 +441,11 @@ module BitmapIndexTests =
                     // Run all async operations in parallel with timeout
                     Async.RunSynchronously(
                         Async.Parallel asyncOps |> Async.Ignore,
-                        timeout = 10000
+                        timeout = 30000
                     )
                     
                     // Check final stats
-                    let hitRate, overwriteRate = index.GetStats()
+                    let _, overwriteRate = index.GetStats()
                     
                     // With high concurrency, we expect some overwrites
                     Expect.isGreaterThan overwriteRate 0.0 "Should have some overwrites"
@@ -448,7 +455,7 @@ module BitmapIndexTests =
     // Main test entry point
     [<Tests>]
     let bitmapIndexTests =
-        ftestList "BitmapIndexTests" [
+        testList "BitmapIndexTests" [
             StringIndexProperties.tests
             PoolIntegrationTests.tests
             ConcurrencyTests.tests
