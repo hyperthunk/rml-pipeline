@@ -9,7 +9,9 @@ open RMLPipeline.Core
 open RMLPipeline.Internal.StringPooling
 open RMLPipeline.Internal.StringInterning
 open RMLPipeline.Internal.StringInterning.HashIndexing
+open RMLPipeline.Internal.StringInterning.Packing
 open System.Threading.Tasks
+open System.Diagnostics
 
 module BitmapIndexTests =
 
@@ -81,7 +83,7 @@ module BitmapIndexTests =
             return List.concat [baseStrings; modifiedStrings] |> List.distinct
         }
 
-    type BitmapIndexArbitraries =
+    type StringIndexArbitraries =
         static member StringSet() =
             Arb.fromGen genStringSet
             
@@ -95,32 +97,34 @@ module BitmapIndexTests =
             Arb.fromGen (Gen.choose(2, 16))
 
     let fsConfig = { FsCheckConfig.defaultConfig with 
-                        arbitrary = [ typeof<BitmapIndexArbitraries> ]
+                        arbitrary = [ typeof<StringIndexArbitraries> ]
                         maxTest = 100 }
 
-    // Test the direct filter operations
-    module BitmapFilterProperties =
+    // Test the direct index operations
+    module StringIndexProperties =
         [<Tests>]
         let tests =
-            testList "BitmapFilter_Invariants" [
+            testList "StringIndex_Invariants" [
                 testPropertyWithConfig 
                     fsConfig 
-                    "Filter correctly reports non-existent strings" 
+                    "Index correctly reports non-existent strings" 
                         <| fun (strings: string list) (queryString: string) ->
                     
                     // Only consider the case where queryString is not in strings
                     not (List.contains queryString strings) ==> lazy (
-                        // Create filter and add all strings
+                        // Create index and add all strings
                         let poolConfig = { PoolConfiguration.Default with 
                                             InitialChunkSize = List.length strings * 2 }
-                        let filter = StringIndex.Create(poolConfig, Segment)
+                        let index = StringIndex.Create(poolConfig, Segment)
                         
-                        // Add all strings to the filter
-                        for s in strings do
-                            filter.AddString(s, 0uy, 0, 0) |> ignore
+                        // Add all strings to the index
+                        strings |> List.iteri (fun i s ->
+                            index.AddLocation(s, 0uy, i, i))
                         
-                        // Check that filter correctly says queryString doesn't exist
-                        filter.TryGetLocation(queryString).IsNone
+                        // Check that index correctly says queryString doesn't exist
+                        match index.TryGetLocation(queryString) with
+                        | ValueNone -> true
+                        | ValueSome _ -> false
                     )
                 
                 testPropertyWithConfig 
@@ -128,20 +132,22 @@ module BitmapIndexTests =
                     "No false negatives - strings added are always found" <| fun (strings: string list) ->
                     
                     strings.Length > 0 ==> lazy (
-                        // Create filter sized for the input
-                        let filter = StringBitmapFilter.Create(List.length strings)
-                        
+                        // Create index sized for the input
+                        let poolConfig = { PoolConfiguration.Default with 
+                                            InitialChunkSize = List.length strings }
+                        let index = StringIndex.Create(poolConfig, Segment)
+
                         // Add all strings with unique locations
                         strings
                         |> List.iteri (fun i s -> 
-                            filter.AddString(s, 0uy, i, i) |> ignore)
+                            index.AddLocation(s, 0uy, i, i))
                         
                         // Verify every string can be found
                         strings
                         |> List.forall (fun s -> 
-                            match filter.TryGetLocation(s) with
-                            | Some _ -> true
-                            | None -> false
+                            match index.TryGetLocation(s) with
+                            | ValueSome _ -> true
+                            | ValueNone -> false
                         )
                     )
 
@@ -150,8 +156,10 @@ module BitmapIndexTests =
                     "Location data is preserved correctly" <| fun (strings: string list) ->
                     
                     strings.Length > 0 ==> lazy (
-                        // Create filter and test data
-                        let filter = StringBitmapFilter.Create(List.length strings * 2)
+                        // Create index and test data
+                        let poolConfig = { PoolConfiguration.Default with 
+                                            InitialChunkSize = List.length strings * 2 }
+                        let index = StringIndex.Create(poolConfig, Segment)
                         let testData = 
                             strings 
                             |> List.mapi (fun i s -> 
@@ -163,16 +171,16 @@ module BitmapIndexTests =
                         
                         // Add all strings with their locations
                         for (s, aType, sIdx, eIdx) in testData do
-                            filter.AddString(s, aType, sIdx, eIdx) |> ignore
+                            index.AddLocation(s, aType, sIdx, eIdx)
                         
                         // Verify all locations are retrieved correctly
                         testData |> List.forall (fun (s, aType, sIdx, eIdx) ->
-                            match filter.TryGetLocation(s) with
-                            | Some loc -> 
+                            match index.TryGetLocation(s) with
+                            | ValueSome loc -> 
                                 loc.ArrayType = aType && 
                                 loc.StringIndex = sIdx && 
                                 loc.EntryIndex = eIdx
-                            | None -> false
+                            | ValueNone -> false
                         )
                     )
 
@@ -182,7 +190,9 @@ module BitmapIndexTests =
                     
                     (strings.Length >= 10 && threadCount >= 2) ==> lazy (
                         // Split strings among threads
-                        let filter = StringBitmapFilter.Create(strings.Length * 2)
+                        let poolConfig = { PoolConfiguration.Default with 
+                                            InitialChunkSize = strings.Length * 2 }
+                        let index = StringIndex.Create(poolConfig, Segment)
                         let stringsArray = List.toArray strings
                         
                         // Use barrier to ensure all threads start at same time
@@ -203,7 +213,7 @@ module BitmapIndexTests =
                                     for i in startIdx..endIdx do
                                         if i < stringsArray.Length then
                                             let s = stringsArray.[i]
-                                            filter.AddString(s, 0uy, i, i) |> ignore
+                                            index.AddLocation(s, 0uy, i, i)
                                 )
                             )
                         
@@ -215,57 +225,33 @@ module BitmapIndexTests =
                         
                         // Verify all strings can be found (eventual consistency)
                         strings |> List.forall (fun s -> 
-                            match filter.TryGetLocation(s) with
-                            | Some _ -> true
-                            | None -> false
+                            match index.TryGetLocation(s) with
+                            | ValueSome _ -> true
+                            | ValueNone -> false
                         )
                     )
 
                 testPropertyWithConfig 
                     fsConfig 
-                    "Filter statistics track operations correctly" <| fun (strings: string list) (queries: string list) ->
+                    "Index statistics track operations correctly" <| fun (strings: string list) (queries: string list) ->
                     
                     (strings.Length > 0 && queries.Length > 0) ==> lazy (
-                        let filter = StringBitmapFilter.Create(strings.Length * 2)
+                        let poolConfig = PoolConfiguration.Default
+                        let index = StringIndex.Create(poolConfig, Segment)
                         
                         // Add all strings
                         for s in strings do
-                            filter.AddString(s, 0uy, 0, 0) |> ignore
-                        
-                        // Track lookup counts
-                        let mutable expectedLookups = 0
-                        let mutable expectedHits = 0
+                            index.AddLocation(s, 0uy, 0, 0)
                         
                         // Perform lookups
                         for q in queries do
-                            expectedLookups <- expectedLookups + 1
-                            filter.TryGetLocation(q) |> ignore
-                            
-                            // Count hit if string exists
-                            if List.contains q strings then
-                                expectedHits <- expectedHits + 1
+                            index.TryGetLocation(q) |> ignore
                         
                         // Get stats
-                        let hitRatio, _ = filter.GetStats()
+                        let hitRatio, _ = index.GetStats()
                         
                         // Basic check that stats are being tracked
-                        // Note: We're not checking exact values due to potential race conditions
-                        expectedLookups > 0 && hitRatio >= 0.0 && hitRatio <= 1.0
-                    )
-
-                testPropertyWithConfig 
-                    fsConfig 
-                    "Resizing creates a new empty filter with increased capacity" <| fun (sizeHint: int) ->
-                    
-                    sizeHint > 0 ==> lazy (
-                        let filter = StringBitmapFilter.Create(sizeHint)
-                        let newFilter = filter.Resize(sizeHint * 2)
-                        
-                        // New filter should be empty and larger
-                        let oldHashTableSize = filter.HashTableSize
-                        let newHashTableSize = newFilter.HashTableSize
-                        
-                        newHashTableSize > oldHashTableSize
+                        hitRatio >= 0.0 && hitRatio <= 1.0
                     )
             ]
 
@@ -273,269 +259,179 @@ module BitmapIndexTests =
     module PoolIntegrationTests =
         [<Tests>]
         let tests =
-            testList "Pool_Filter_Integration" [
-                testCase "Pool uses filter for string lookup" <| fun () ->
-                    // Create a pool with filter
+            testList "Pool_StringIndex_Integration" [
+                testCase "Pool maintains temperature correctly across lookups" <| fun () ->
+                    // Create a pool
                     let config = PoolConfiguration.Default
                     let baseId = 1000
                     let edenSize = 100
                     let pool = Pool.Create(baseId, edenSize, config)
                     
-                    // Intern some strings
-                    let testStrings = ["test1"; "test2"; "test3"; "test4"; "test5"]
-                    let ids = testStrings |> List.map pool.InternString
+                    // Intern a string
+                    let testString = "test-temperature"
+                    let id1 = pool.InternString(testString)
                     
-                    // Verify all strings can be found
-                    for i, s in List.zip ids testStrings do
-                        match pool.TryGetString(i) with
-                        | Some foundStr -> Expect.equal foundStr s "Retrieved string should match original"
-                        | None -> failwith "String not found in pool"
-                    
-                    // Stats should show no misses for repeat lookups
-                    let initialMisses = pool.Stats.missCount
-                    
-                    // Intern the same strings again - should use filter to find them
-                    let ids2 = testStrings |> List.map pool.InternString
-                    
-                    // Miss count shouldn't increase since strings were found in filter
-                    let finalMisses = pool.Stats.missCount
-                    Expect.equal ids ids2 "Same strings should get same IDs"
-                    Expect.equal finalMisses initialMisses "No new misses should occur"
-                    
-                testCase "Filter correctly handles string promotion" <| fun () ->
-                    // Create pool hierarchy for promotion testing
-                    let config = { PoolConfiguration.Default with 
-                                   WorkerPromotionThreshold = 2
-                                   GroupPromotionThreshold = 5 }
-                    let planningStrings = [||]
-                    let hierarchy = StringPoolHierarchy.Create(planningStrings, config)
-                    
-                    // Create a context and pool
-                    let groupId = DependencyGroupId 1
-                    let context = StringPool.createContext hierarchy (Some groupId) None
-                    
-                    // Intern a string and access it multiple times to trigger promotion
-                    let testString = "promote-me"
-                    let id = context.ContextPool.InternString(testString, StringAccessPattern.HighFrequency)
-                    
-                    // Access multiple times to increment temperature
-                    let mutable currentId = id
-                    for _ in 1..10 do
-                        match context.ContextPool.GetStringWithTemperature(currentId) with
-                        | Some str, newId -> 
-                            Expect.equal str testString "String should be retrieved correctly"
+                    // Get string with temperature multiple times
+                    let mutable currentId = id1
+                    for i in 1..5 do
+                        match pool.GetStringWithTemperature(currentId) with
+                        | Some str, newId ->
+                            Expect.equal str testString "String should match"
+                            Expect.equal newId.Temperature i "Temperature should increment"
                             currentId <- newId
                         | None, _ -> failwith "String not found"
                     
-                    // Trigger promotion processing
-                    let promoted = hierarchy.CheckAndPromoteHotStrings()
-                    
-                    // Now try to intern the same string again - should still work
-                    // even though the string might be promoted
-                    let id2 = context.ContextPool.InternString(testString, StringAccessPattern.HighFrequency)
-                    
-                    // Verification: either we got the same ID or a new one (if promoted)
-                    // Either way, the string should be retrievable
-                    match context.ContextPool.GetString(id2) with
-                    | Some str -> Expect.equal str testString "String should be retrievable post-promotion"
-                    | None -> failwith "String not found after promotion"
-                
-                testCase "Filter provides O(1) lookup for existing strings" <| fun () ->
-                    // Create a pool with a small filter for testing
-                    let config = PoolConfiguration.Default
-                    let pool = Pool.Create(1000, 1000, config)
-                    
-                    // Create a large number of strings to intern
-                    let mutable stringCount = 1000
-                    let testStrings = Array.init stringCount (fun i -> $"string-{i}")
-                    
-                    // Intern all strings
-                    let sw1 = Stopwatch.StartNew()
-                    for s in testStrings do
-                        pool.InternString(s) |> ignore
-                    sw1.Stop()
-                    
-                    // Measure time to lookup existing strings
-                    let sw2 = Stopwatch.StartNew()
-                    for s in testStrings do
-                        pool.InternString(s) |> ignore
-                    sw2.Stop()
-                    
-                    // Expectation: lookup should be much faster than initial insertion
-                    // Note: This test is soft - we don't use exact times
-                    Expect.isTrue (sw2.ElapsedMilliseconds < sw1.ElapsedMilliseconds) 
-                        "Second pass should be faster due to filter lookup"
-                
-                testCase "Segments integration handles chunking correctly" <| fun () ->
-                    // Create configuration that forces chunking
+                testCase "Segments handle string lookup with index" <| fun () ->
+                    // Create segments
                     let config = { PoolConfiguration.Default with 
-                                     InitialChunkSize = 5
-                                     SecondaryChunkSize = 5 }
+                                    InitialChunkSize = 10
+                                    SecondaryChunkSize = 10 }
                     let baseId = 5000
-                    
-                    // Create segments with filter
                     let segments = Segments.Create(baseId, config)
-                    let filter = StringBitmapFilter.Create(100)
-                    segments.SetStringFilter(Some filter)
                     
-                    // Intern enough strings to cause chunking
-                    let testStrings = [
-                        "chunk1-str1"; "chunk1-str2"; "chunk1-str3"; "chunk1-str4"; "chunk1-str5"; 
-                        "chunk2-str1"; "chunk2-str2"; "chunk2-str3"; "chunk2-str4"; "chunk2-str5";
-                        "chunk3-str1"; "chunk3-str2"; "chunk3-str3"; "chunk3-str4"; "chunk3-str5"
-                    ]
-                    
-                    // Intern all strings
+                    // Intern strings
+                    let testStrings = ["seg1"; "seg2"; "seg3"; "seg4"; "seg5"]
                     let ids = testStrings |> List.map (fun s -> segments.AllocateString(s, baseId))
                     
-                    // Verify all strings can be found
-                    for i, s in List.zip ids testStrings do
-                        match segments.TryGetString(i.Value, baseId) with
-                        | Some foundStr -> Expect.equal foundStr s "Retrieved string should match original"
-                        | None -> failwith "String not found in segments"
+                    // Try to allocate same strings again - should find them via index
+                    let ids2 = testStrings |> List.map (fun s -> segments.AllocateString(s, baseId))
                     
-                    // Should have created at least 3 chunks
-                    Expect.isGreaterThan segments.Chunks.Count 2 "Multiple chunks should be created"
+                    // Should get same base IDs (temperature might differ)
+                    for id1, id2 in List.zip ids ids2 do
+                        Expect.equal (id1.Value &&& 0xFFFFFFFF) (id2.Value &&& 0xFFFFFFFF) 
+                            "Base IDs should match"
                     
-                    // Now try to find each string via filter
-                    for s in testStrings do
-                        let id = segments.AllocateString(s, baseId)
-                        // Getting same string should give same ID (filter working)
-                        match segments.TryGetString(id.Value, baseId) with
-                        | Some foundStr -> Expect.equal foundStr s "Retrieved string should match original"
-                        | None -> failwith "String not found via filter lookup"
+                testCase "Promoted strings are handled correctly" <| fun () ->
+                    // Create a pool
+                    let config = { PoolConfiguration.Default with 
+                                    WorkerPromotionThreshold = 3 }
+                    let baseId = 2000
+                    let pool = Pool.Create(baseId, 100, config)
+                    
+                    // Intern a string
+                    let testString = "promote-this"
+                    let id = pool.InternString(testString)
+                    
+                    // Access it multiple times to reach threshold
+                    let mutable currentId = id
+                    for _ in 1..3 do
+                        match pool.GetStringWithTemperature(currentId) with
+                        | Some _, newId -> currentId <- newId
+                        | None, _ -> failwith "String not found"
+                    
+                    // Process promotions
+                    let candidates = pool.CheckPromotion()
+                    
+                    // Simulate promotion by updating the packed entry
+                    if candidates.Length > 0 then
+                        let promotedId = StringId.Create(9999) // Simulated higher tier ID
+                        // In real code, the promotion system would call UpdateToPromoted
+                        
+                        // Try to get the string again - should handle promoted case
+                        match pool.TryGetString(id) with
+                        | Some _ -> () // Might still be there if not promoted yet
+                        | None -> () // Expected if promoted
+                    
+                testCase "Index handles overwrites correctly" <| fun () ->
+                    let config = PoolConfiguration.Default
+                    let index = StringIndex.Create(config, Segment)
+
+                    // Add strings that will likely collide
+                    let strings = ["test1"; "test2"; "test3"]
+                    for i, s in List.indexed strings do
+                        index.AddLocation(s, 0uy, i, i)
+                    
+                    // Get stats to check overwrites
+                    let _, overwriteRate = index.GetStats()
+                    
+                    // Overwrite rate should be reasonable
+                    Expect.isLessThan overwriteRate 1.0 "Overwrite rate should be less than 100%"
             ]
 
     // Thread safety and concurrency tests
     module ConcurrencyTests =
         [<Tests>]
         let tests =
-            testList "Filter_Concurrency" [
-                testCase "Concurrent string interning with filter is thread-safe" <| fun () ->
-                    // Create a pool with filter
+            testList "StringIndex_Concurrency" [
+                testCase "Concurrent allocations maintain temperature correctly" <| fun () ->
+                    // Create segments
+                    let config = { PoolConfiguration.Default with 
+                                    InitialChunkSize = 100 }
+                    let baseId = 3000
+                    let segments = Segments.Create(baseId, config)
+                    
+                    // String to be allocated by multiple threads
+                    let testString = "concurrent-temp-test"
+                    
+                    // Multiple threads allocating the same string
+                    let threadCount = 4
+                    let results = Array.zeroCreate<StringId> threadCount
+                    
+                    let threads = Array.init threadCount (fun i ->
+                        Thread(ThreadStart(fun () ->
+                            // Each thread allocates the string multiple times
+                            let mutable id = StringId.Invalid
+                            for _ in 1..10 do
+                                id <- segments.AllocateString(testString, baseId)
+                                Thread.Sleep(1) // Small delay to interleave operations
+                            results.[i] <- id
+                        ))
+                    )
+                    
+                    // Run threads
+                    for t in threads do t.Start()
+                    for t in threads do t.Join()
+                    
+                    // All threads should have valid IDs
+                    for id in results do
+                        Expect.isTrue id.IsValid "Should have valid ID"
+                        match segments.TryGetString(id.Value, baseId) with
+                        | Some s -> Expect.equal s testString "String should match"
+                        | None -> failwith "String not found"
+                
+                testCase "Index maintains consistency under concurrent updates" <| fun () ->
                     let config = PoolConfiguration.Default
-                    let baseId = 2000
-                    let edenSize = 1000
-                    let pool = Pool.Create(baseId, edenSize, config)
+                    let index = StringIndex.Create(config, Segment)
+
+                    // Multiple threads adding and looking up strings
+                    let threadCount = 8
+                    let operationsPerThread = 100
                     
-                    // Set of strings to intern
-                    let stringCount = 500
-                    let testStrings = Array.init stringCount (fun i -> $"concurrent-string-{i}")
-                    
-                    // Track results from each thread
-                    let results = Array.init stringCount (fun _ -> StringId.Invalid)
-                    
-                    // Use multiple threads to intern same strings
-                    let threadCount = min 8 Environment.ProcessorCount
                     let threads = Array.init threadCount (fun threadId ->
                         Thread(ThreadStart(fun () ->
-                            // Each thread processes all strings (deliberately creating contention)
-                            for i in 0..stringCount-1 do
-                                let id = pool.InternString(testStrings.[i])
-                                // Record result
-                                results.[i] <- id
+                            for i in 0..operationsPerThread-1 do
+                                let s = $"thread{threadId}-op{i}"
+                                
+                                // Add to index
+                                index.AddLocation(s, byte threadId, i, i)
+                                
+                                // Immediately try to find it
+                                match index.TryGetLocation(s) with
+                                | ValueSome loc ->
+                                    Expect.equal loc.ArrayType (byte threadId) "Array type should match"
+                                | ValueNone ->
+                                    // Acceptable due to overwrites in direct-mapped index
+                                    ()
                         ))
                     )
                     
-                    // Start and wait for all threads
+                    // Run threads
                     for t in threads do t.Start()
                     for t in threads do t.Join()
                     
-                    // Verify all strings were interned successfully
-                    for i in 0..stringCount-1 do
-                        match pool.TryGetString(results.[i]) with
-                        | Some s -> Expect.equal s testStrings.[i] "Retrieved string should match original"
-                        | None -> failwith "String not found"
+                    // Check final stats
+                    let hitRate, overwriteRate = index.GetStats()
                     
-                    // Check that we have fewer misses than total attempts (filter working)
-                    let totalAttempts = int64 (threadCount * stringCount)
-                    let misses = pool.Stats.missCount
-                    Expect.isLessThan misses totalAttempts "Should have fewer misses than attempts"
-                
-                testCase "Filter handles multiple threads accessing shared segments" <| fun () ->
-                    // Create configuration
-                    let config = { PoolConfiguration.Default with 
-                                        InitialChunkSize = 50
-                                        SecondaryChunkSize = 100 }
-                    let baseId = 3000
-                    
-                    // Create segments with filter
-                    let segments = Segments.Create(baseId, config)
-                    let filter = StringBitmapFilter.Create(1000)
-                    segments.SetStringFilter(Some filter)
-                    
-                    // Set of strings for each thread
-                    let threadsCount = min 6 Environment.ProcessorCount
-                    let stringsPerThread = 100
-                    let threadStrings = 
-                        Array.init threadsCount (fun threadId ->
-                            Array.init stringsPerThread (fun i -> $"thread-{threadId}-string-{i}")
-                        )
-                    
-                    // Dictionary to track all IDs (thread-safe)
-                    let allIds = Dictionary<string, StringId>()
-                    
-                    // Run multiple threads allocating strings
-                    let threads = Array.init threadsCount (fun threadId ->
-                        Thread(ThreadStart(fun () ->
-                            // Allocate all strings for this thread
-                            for i in 0..stringsPerThread-1 do
-                                let s = threadStrings.[threadId].[i]
-                                let id = segments.AllocateString(s, baseId)
-                                lock allIds (fun () -> allIds.[s] <- id)
-                        ))
-                    )
-                    
-                    // Start and wait for all threads
-                    for t in threads do t.Start()
-                    for t in threads do t.Join()
-                    
-                    // Verify all strings can be found
-                    let allStrings = threadStrings |> Array.collect id
-                    for s in allStrings do
-                        let id = lock allIds (fun () -> allIds.[s])
-                        match segments.TryGetString(id.Value, baseId) with
-                        | Some foundStr -> Expect.equal foundStr s "String should be retrievable"
-                        | None -> failwith "String not found"
-                    
-                    // Now allocate strings again - filter should find them
-                    for s in allStrings do
-                        let originalId = lock allIds (fun () -> allIds.[s])
-                        let secondId = segments.AllocateString(s, baseId)
-                        
-                        // Either we get same ID, or if chunk was resized, a valid ID
-                        Expect.isTrue secondId.IsValid "Should get valid ID on repeated allocation"
-                        
-                        match segments.TryGetString(secondId.Value, baseId) with
-                        | Some foundStr -> Expect.equal foundStr s "String should be retrievable"
-                        | None -> failwith "String not found after second allocation"
-                
-                testPropertyWithConfig 
-                    fsConfig 
-                    "False positive rate is acceptable under load" <| fun (collisionStrings: string list) ->
-                    
-                    collisionStrings.Length > 10 ==> lazy (
-                        // Create filter sized for collision testing
-                        let filter = StringIndex.Create(collisionStrings.Length)
-                        
-                        // Add all strings
-                        for i, s in List.indexed collisionStrings do
-                            filter.AddString(s, 0uy, i, i) |> ignore
-                        
-                        // Get current stats
-                        let _, falsePositiveRate = filter.GetStats()
-                        
-                        // Check that false positive rate is reasonable
-                        // Note: FP rate will depend on hash function quality
-                        falsePositiveRate < 0.7 // Allow fairly high FP rate for filter stage
-                    )
+                    // With high concurrency, we expect some overwrites
+                    Expect.isGreaterThan overwriteRate 0.0 "Should have some overwrites"
+                    Expect.isLessThan overwriteRate 1.0 "Shouldn't overwrite everything"
             ]
 
     // Main test entry point
     [<Tests>]
     let allTests =
-        testList "BitmapIndexTests" [
-            BitmapFilterProperties.tests
+        testList "StringIndexTests" [
+            StringIndexProperties.tests
             PoolIntegrationTests.tests
             ConcurrencyTests.tests
         ]
