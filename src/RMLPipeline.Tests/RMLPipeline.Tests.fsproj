@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
@@ -9,8 +9,16 @@
     <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="RMLCoreGenerators.fs" />
     <Compile Include="RMLVocabTests.fs" />
-    <Compile Include="PipelineModelTests.fs" />
+    <Compile Include="TemplateTests.fs" />
+    <Compile Include="StringInterningGenerators.fs" />
+    <Compile Include="TypeLevelTests.fs" />
+    <Compile Include="BitmapIndexTests.fs" />
+    <Compile Include="StringPoolTests.fs" />
+    <Compile Include="StringInterningTests.fs" />
+    <Compile Include="PlannerModelTests.fs" />
+    <!-- <Compile Include="PipelineModelTests.fs" /> -->
     <Compile Include="Main.fs" />
   </ItemGroup>
   <ItemGroup>

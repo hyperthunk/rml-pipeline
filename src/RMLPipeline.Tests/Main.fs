@@ -2,19 +2,33 @@
 
     module TestRunner =
         open Expecto
+        open RMLPipeline.Tests.VocabSuite
+        open RMLPipeline.Tests.TemplateTests
+        open RMLPipeline.Tests.StringInterningTests
+        open RMLPipeline.Tests.StringPoolIntegrationTests
+        open RMLPipeline.Tests.PlannerModelTests
+        open RMLPipeline.Tests.TypeLevelTests
+        open RMLPipeline.Tests.BitmapIndexTests
+        // open RMLPipeline.Tests.PipelineModelBased
 
-            open Expecto
-            open RMLPipeline.Tests.VocabSuite
-            open RMLPipeline.Tests.PipelineModelBased
+        [<EntryPoint>]
+        let main argv =
+            (* let allTests = testList "All RML Tests" [
+                allComputationRMLTests
+                pipelinePropertyTests
+                pipelineModelBasedTests                    
+            ] *)
 
-            [<EntryPoint>]
-            let main argv =
-                let allTests = testList "All RML Tests" [
+            let allTests = 
+                testList "RMLPipeline" [
+                    typeLevelTests
+                    bitmapIndexTests
+                    allStringInterningTests
+                    allStringPoolIntegrationTests
                     allComputationRMLTests
-                    pipelinePropertyTests
-                    pipelineModelBasedTests                    
+                    allTemplateTests
+                    allStatefulPlannerTests
                 ]
-                
-                allTests
-                |> Test.shuffle defaultConfig.joinWith.asString
-                |> runTestsWithCLIArgs [] argv
+            
+            allTests
+            |> runTestsWithCLIArgs [] argv

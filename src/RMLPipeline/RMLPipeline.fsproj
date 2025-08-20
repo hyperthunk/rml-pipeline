@@ -8,8 +8,14 @@
   <ItemGroup>
     <Compile Include="FastMap.fs" />
     <Compile Include="Model.fs" />
+    <Compile Include="Types.fs" />
+    <Compile Include="Templates.fs" />
     <Compile Include="DSL.fs" />
-    <Compile Include="Pipeline.fs" />
+    <Compile Include="StringInterning.fs" />
+    <Compile Include="StringPool.fs" />
+    <Compile Include="Streaming.fs" />
+    <Compile Include="Planner.fs" />
+    <!-- <Compile Include="Pipeline.fs" /> -->
   </ItemGroup>
   <Import Project="..\..\.paket\Paket.Restore.targets" />
 </Project>

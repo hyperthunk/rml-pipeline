@@ -4,6 +4,7 @@ namespace RMLPipeline.Tests
 
         open Expecto
         open RMLPipeline
+        open RMLPipeline.Core
         open RMLPipeline.Model
         open RMLPipeline.DSL
         
@@ -481,7 +482,7 @@ namespace RMLPipeline.Tests
 
         [<Tests>]
         let allComputationRMLTests = 
-            testList "All ComputationRML Tests" [
+            testList "Vocabulary" [
                 expressionMapTests
                 termMapTests
                 subjectMapTests

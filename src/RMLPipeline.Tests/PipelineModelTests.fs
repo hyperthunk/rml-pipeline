@@ -811,7 +811,7 @@ module PipelineModelBased =
                     mockOutput.EmittedTriples.Length > 0
                 )
 
-            ftestCase "test specific generated path" <| fun _ ->
+            testCase "test specific generated path" <| fun _ ->
                 let mockOutput = MockTripleOutputStream()
                 // Use one of the paths from your debug output
                 let generatedPath = "$.jrnkYmGUu8cqfTyB1p.Mr5UiCQF4YRgZ85I7b[*]"

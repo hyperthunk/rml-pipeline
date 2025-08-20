@@ -4,56 +4,8 @@ namespace RMLPipeline
 module DSL =
 
     open RMLPipeline.Model
-
-    // State monad ish thing
-    type State<'S, 'T> = State of ('S -> 'T * 'S)
-    
-    // thanks for the insp, Haskell :)
-    let runState (State f) state = f state
-    let evalState (State f) state = fst (f state)
-    let execState (State f) state = snd (f state)
-    
-    // State modification
-    let get<'S> : State<'S, 'S> = State (fun s -> (s, s))
-    let put<'S> (newState: 'S) : State<'S, unit> = State (fun _ -> ((), newState))
-    let modify<'S> (f: 'S -> 'S) : State<'S, unit> = State (fun s -> ((), f s))
-    
-    // State computation expressions
-    type StateBuilder() =
-        member _.Return(x) = State (fun s -> (x, s))
-        member _.ReturnFrom(m) = m
-        member _.Bind(State f, k) = State (fun s -> 
-            let (a, s') = f s
-            let (State g) = k a
-            g s')
-        member _.Zero() = State (fun s -> ((), s))
-        member _.Combine(State f, State g) = State (fun s ->
-            let (_, s') = f s
-            g s')
-        member _.Delay(f) = State (fun s -> runState (f()) s)
-        member _.For(seq, body) = 
-            let folder state item = 
-                let (_, newState) = runState (body item) state
-                newState
-            State (fun s -> ((), Seq.fold folder s seq))
-        member _.While(guard, body) =
-            let rec loop s =
-                if guard() then
-                    let (_, s') = runState body s
-                    loop s'
-                else ((), s)
-            State loop
-
-    let state = StateBuilder()
-
-    // Lifting functions for convenience
-    let lift f = State (fun s -> (f s, s))
-    let lift2 f a b = state {
-        let! x = a
-        let! y = b
-        return f x y
-    }
-
+    open RMLPipeline.Core
+ 
     // Expression Map Builder
     type ExpressionMapBuilder() =
         member _.Return(_) = State (fun s -> ((), s))
@@ -142,6 +94,10 @@ module DSL =
         member _.Delay(f) = state { return! f() }
         member _.Yield(_) = State (fun s -> ((), s))
         member _.YieldFrom(m) = m
+        member _.For(seq, body) = state {
+            for item in seq do
+                do! body item
+        }
 
     let subjectMap = SubjectMapBuilder()
 
@@ -463,6 +419,14 @@ module DSL =
             do! asIRI
         }
         
+        /// Create a simple template term map as literal
+        let templateTermAsLiteral (tmpl: string) = termMap {
+            do! expressionMap (exprMap {
+                do! template tmpl
+            })
+            do! asLiteral
+        }
+
         /// Create a simple reference term map as literal
         let refTermAsLiteral (ref: string) = termMap {
             do! expressionMap (exprMap {
